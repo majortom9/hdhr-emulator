@@ -1,0 +1,15 @@
+[Unit]
+Description=HDHomeRun protocol emulator (direct DVB ATSC tuner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hdhr-emulator /etc/hdhr-emulator.conf
+Restart=on-failure
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
