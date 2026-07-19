@@ -464,11 +464,15 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         tuner_lock(t);
         t->tuned_frequency_hz = freq;
         t->vch_resolved = false; /* raw tune doesn't select a specific virtual channel yet */
-        if (rf_channel > 0) {
-            snprintf(t->channel, sizeof(t->channel), "us-bcast:%d", rf_channel);
-        } else {
-            snprintf(t->channel, sizeof(t->channel), "auto:%u", freq);
-        }
+        /* "8vsb:<freq_hz>" — confirmed against a genuine HDHomeRun3's
+         * actual "Physical Channel" display in hdhomerun_config_gui
+         * (2026-07-18): it reports modulation:frequency, not
+         * "us-bcast:<N>" (that channel-map-name form is only the
+         * *input* syntax for the Channel selector, not what a real
+         * device echoes back). rf_channel is still recorded on the
+         * dvb_channel entries themselves (see dvb_scan.c) — it's just
+         * not part of this reported string. */
+        snprintf(t->channel, sizeof(t->channel), "8vsb:%u", freq);
         snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
         tuner_unlock(t);
 

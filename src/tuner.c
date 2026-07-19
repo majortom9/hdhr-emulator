@@ -98,10 +98,12 @@ void tuner_bind_channel(struct hdhr_tuner *t, const struct dvb_channel *ch, int 
     t->tuned_frequency_hz = ch->frequency_hz;
     /* real firmware's "ch=" is the RF tuning descriptor, not the virtual
      * channel — hdhomerun_config(_gui) displays this verbatim as
-     * "Physical Channel". Real ATSC/OTA firmware uses "us-bcast:N"
-     * (channel map name + RF channel number), not modulation:frequency —
-     * confirmed against a genuine device's actual display. */
-    snprintf(t->channel, sizeof(t->channel), "us-bcast:%d", ch->rf_channel);
+     * "Physical Channel". "8vsb:<freq_hz>" — confirmed against a genuine
+     * HDHomeRun3's actual display (2026-07-18): it reports
+     * modulation:frequency, not "us-bcast:<N>" (that channel-map-name
+     * form is only the *input* syntax for the Channel selector control,
+     * not what a real device echoes back as its tuned state). */
+    snprintf(t->channel, sizeof(t->channel), "8vsb:%u", ch->frequency_hz);
     /* DVB_PROGRAM_DEFAULT (-1) means "no override" — report the program
      * actually being streamed (the channel's own), not the -1 sentinel,
      * since -1 isn't a value a client setting /tunerN/program would
