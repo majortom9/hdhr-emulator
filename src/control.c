@@ -298,11 +298,42 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
 
 static bool parse_channel_value(const char *value, uint32_t *out_freq, int *out_rf_channel)
 {
-    if (strncmp(value, "auto:", 5) == 0 || strncmp(value, "8vsb:", 5) == 0) {
+    if (strncmp(value, "auto:", 5) == 0) {
+        uint32_t n = (uint32_t)strtoul(value + 5, NULL, 10);
+        if (n == 0) return false;
+        /* "auto:" is ambiguous by design in the real protocol: it
+         * accepts either a small channel NUMBER or a raw frequency in
+         * Hz under the same prefix, and real firmware distinguishes by
+         * magnitude. Confirmed live via packet capture — the scan path
+         * (hdhomerun_channelscan.c's channelscan_find_lock()) sends
+         * "auto:<freq_hz>" (e.g. "auto:497000000"), but
+         * hdhomerun_config_gui's manual channel-number up/down spinner
+         * sends "auto:<N>" with N being the small channel number itself
+         * (e.g. "auto:32", "auto:33") — confirmed via a live tcpdump
+         * capture of the GUI's spinner clicks, which is why turning
+         * that spinner never visibly worked against this daemon: we
+         * were tuning to a literal 32 Hz "frequency", which obviously
+         * never locks. ATSC channel numbers here only ever run 2-36;
+         * any real RF frequency is tens of millions of Hz, so a low
+         * threshold unambiguously separates the two forms. */
+        if (n < 1000) {
+            uint32_t freq = atsc_channel_to_freq((int)n);
+            if (freq == 0) return false; /* unknown/out-of-range channel number */
+            *out_freq = freq;
+            *out_rf_channel = (int)n;
+            return true;
+        }
+        *out_freq = n;
+        *out_rf_channel = atsc_freq_to_channel(n); /* 0 if not an exact table match — still fine to tune */
+        return true;
+    }
+    if (strncmp(value, "8vsb:", 5) == 0) {
+        /* Unlike "auto:", "8vsb:" always means an explicit frequency
+         * (modulation:frequency) — no ambiguity to resolve here. */
         uint32_t freq = (uint32_t)strtoul(value + 5, NULL, 10);
         if (freq == 0) return false;
         *out_freq = freq;
-        *out_rf_channel = atsc_freq_to_channel(freq); /* 0 if not an exact table match — still fine to tune */
+        *out_rf_channel = atsc_freq_to_channel(freq);
         return true;
     }
     if (strncmp(value, "us-bcast:", 9) == 0) {
