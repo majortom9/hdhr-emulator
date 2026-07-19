@@ -228,6 +228,20 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                      stats.snr_quality_pct < 0 ? 0 : stats.snr_quality_pct,
                      stats.symbol_quality_pct < 0 ? 0 : stats.symbol_quality_pct,
                      bps, pps);
+        } else if (t->scan_stats_valid && t->scan_stats_freq == t->tuned_frequency_hz) {
+            /* No active stream, but a /tunerN/channel scan has published
+             * at least one live reading for the frequency we're
+             * currently on — report it instead of the bare placeholder
+             * below, same reasoning as the streaming branch above (see
+             * tuner.h's scan_stats comment). */
+            struct dvb_signal_stats *stats = &t->scan_stats;
+            snprintf(val, sizeof(val),
+                     "ch=%s lock=%s ss=%d snq=%d seq=%d",
+                     t->channel,
+                     stats->has_lock ? "8vsb" : "none",
+                     stats->signal_strength_pct < 0 ? 0 : stats->signal_strength_pct,
+                     stats->snr_quality_pct < 0 ? 0 : stats->snr_quality_pct,
+                     stats->symbol_quality_pct < 0 ? 0 : stats->symbol_quality_pct);
         } else {
             snprintf(val, sizeof(val), "%s", t->status);
         }
@@ -333,6 +347,37 @@ static void finalize_lock_result(struct hdhr_tuner *t, uint32_t freq, bool locke
     tuner_unlock(t);
 }
 
+/* Passed as the progress_ctx to dvb_scan_tune_and_lock()'s progress
+ * callback — carries the frequency the *current* loop iteration is
+ * attempting, since channel_scan_thread_main reuses one thread across
+ * several frequencies (see the pending-queue drain below) and a stale
+ * freq here would mislabel published stats. */
+struct scan_progress_ctx {
+    struct hdhr_tuner *t;
+    uint32_t freq;
+};
+
+/* Called from dvb_frontend_wait_lock()'s poll loop, on the scan
+ * thread's own stack — never a different thread touching fd
+ * concurrently (see dvb_frontend_progress_cb's comment for why that
+ * matters). Publishes a live signal-stat snapshot so /tunerN/status can
+ * report real ss=/snq=/seq= while a scan is still working, matching
+ * real HDHomeRun firmware (see tuner.h's scan_stats comment for why
+ * this matters beyond cosmetics: libhdhomerun's own client gives up
+ * polling immediately if ss looks like "no signal"). */
+static void publish_scan_stats(void *ctx, int fd)
+{
+    struct scan_progress_ctx *pc = ctx;
+    struct dvb_signal_stats stats;
+    dvb_frontend_read_stats(fd, &stats);
+
+    tuner_lock(pc->t);
+    pc->t->scan_stats = stats;
+    pc->t->scan_stats_valid = true;
+    pc->t->scan_stats_freq = pc->freq;
+    tuner_unlock(pc->t);
+}
+
 static void *channel_scan_thread_main(void *arg)
 {
     struct channel_scan_ctx *ctx = arg;
@@ -341,8 +386,10 @@ static void *channel_scan_thread_main(void *arg)
     int rf_channel = ctx->rf_channel;
 
     for (;;) {
+        struct scan_progress_ctx pc = { .t = t, .freq = freq };
         int ffd;
-        bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, freq, &ffd);
+        bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, freq, &ffd,
+                                              publish_scan_stats, &pc);
 
         pthread_mutex_lock(&ctx->mutex);
         ctx->locked = locked;

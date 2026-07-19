@@ -92,7 +92,8 @@ static int read_tvct(int adapter, int demux_num, struct tvct_entry *out, int max
     return total;
 }
 
-bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd)
+bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd,
+                             dvb_frontend_progress_cb progress_cb, void *progress_ctx)
 {
     *out_ffd = -1;
 
@@ -103,7 +104,7 @@ bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *ou
         dvb_frontend_close(ffd);
         return false;
     }
-    if (!dvb_frontend_wait_lock(ffd, LOCK_TIMEOUT_MS)) {
+    if (!dvb_frontend_wait_lock(ffd, LOCK_TIMEOUT_MS, progress_cb, progress_ctx)) {
         dvb_frontend_close(ffd); /* no signal on this frequency — normal, most will miss */
         return false;
     }
@@ -229,7 +230,7 @@ int dvb_scan_run(int adapter, int frontend, int demux_num)
     int total = 0;
     for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
         int ffd;
-        if (dvb_scan_tune_and_lock(adapter, frontend, atsc_freq_table[i].frequency_hz, &ffd)) {
+        if (dvb_scan_tune_and_lock(adapter, frontend, atsc_freq_table[i].frequency_hz, &ffd, NULL, NULL)) {
             total += dvb_scan_read_psip(adapter, demux_num, atsc_freq_table[i].channel,
                                          atsc_freq_table[i].frequency_hz, ffd);
         }

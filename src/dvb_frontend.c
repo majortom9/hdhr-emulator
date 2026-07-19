@@ -61,13 +61,14 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
     return 0;
 }
 
-bool dvb_frontend_wait_lock(int fd, int timeout_ms)
+bool dvb_frontend_wait_lock(int fd, int timeout_ms, dvb_frontend_progress_cb cb, void *cb_ctx)
 {
     int elapsed = 0;
     const int step_ms = 50;
     while (elapsed < timeout_ms) {
         fe_status_t status = 0;
         if (ioctl(fd, FE_READ_STATUS, &status) == 0) {
+            if (cb) cb(cb_ctx, fd);
             if (status & FE_HAS_LOCK) return true;
         }
         usleep(step_ms * 1000);

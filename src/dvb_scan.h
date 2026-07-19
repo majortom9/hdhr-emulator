@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "dvb_frontend.h"
+
 /* Tunes through every table entry in atsc_freq_table on the given
  * adapter/frontend/demux, and for each frequency that locks, parses
  * PAT+PMT+TVCT to populate the global dvb_channel database (see
@@ -35,7 +37,8 @@ int dvb_scan_run(int adapter, int frontend, int demux_num);
  * this in a background thread and bound their own wait with a condition
  * variable rather than assuming this call itself is bounded — see
  * control.c's /tunerN/channel SET handler for the pattern. */
-bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd);
+bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd,
+                             dvb_frontend_progress_cb progress_cb, void *progress_ctx);
 
 /* Reads PAT+PMT+TVCT off an already-locked frontend (ffd, as returned by
  * dvb_scan_tune_and_lock on success) and merges any channels found into

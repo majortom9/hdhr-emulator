@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include "config.h"
 #include "dvb_stream.h"
+#include "dvb_frontend.h"
 
 /* Sized above ATSC_FREQ_TABLE_COUNT (35, see atsc_freq.h) — see
  * hdhr_tuner.pending_queue below. */
@@ -47,6 +48,28 @@ struct hdhr_tuner {
                                    * actively streaming — see control.c. */
 
     char     status[160];
+
+    /* Live signal stats published by an in-flight /tunerN/channel scan
+     * (control.c's channel_scan_thread_main, via
+     * dvb_scan_tune_and_lock's progress callback) — lets /tunerN/status
+     * report a real `ss=` while a scan is still working, the same way
+     * real HDHomeRun firmware does, instead of always showing ss=0 until
+     * the scan fully finishes. Real ss= matters for more than cosmetics:
+     * libhdhomerun's own hdhomerun_device_wait_for_lock() treats ss<45
+     * as "confirmed no signal" and stops polling immediately — with our
+     * old always-0 placeholder, it couldn't tell "no signal" from
+     * "haven't finished checking yet" and always bailed out early.
+     * Only ever written by the scan thread that owns the frontend fd
+     * (never a different thread touching that fd concurrently — see
+     * dvb_frontend_progress_cb's own comment), but guarded by `lock`
+     * like every other field here since it's read from a different
+     * thread (whichever connection is handling a /tunerN/status GET).
+     * scan_stats_freq lets a reader detect staleness the same way
+     * finalize_lock_result() does for `status`: only trust these values
+     * if they were published for the frequency the tuner is on *now*. */
+    struct dvb_signal_stats scan_stats;
+    bool     scan_stats_valid;
+    uint32_t scan_stats_freq;
 
     bool     busy;
     struct dvb_stream *active_stream;

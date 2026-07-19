@@ -188,7 +188,7 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
         free(s);
         return NULL;
     }
-    if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS)) {
+    if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL)) {
         fprintf(stderr, "dvb_stream: no lock on %u Hz for %d.%d\n",
                 channel->frequency_hz, channel->major, channel->minor);
         dvb_frontend_close(s->frontend_fd);

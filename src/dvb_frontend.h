@@ -25,9 +25,24 @@ void dvb_frontend_close(int fd);
  * 0 on success, -1 on ioctl failure (errno set). */
 int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz);
 
+/* Called once per poll iteration inside dvb_frontend_wait_lock(), from
+ * the SAME thread that owns fd (never a different thread) — see that
+ * function's own comment for why this matters. */
+typedef void (*dvb_frontend_progress_cb)(void *ctx, int fd);
+
 /* Polls FE_READ_STATUS until FE_HAS_LOCK or timeout_ms elapses. Returns
- * true if locked. */
-bool dvb_frontend_wait_lock(int fd, int timeout_ms);
+ * true if locked. If cb is non-NULL, it's called on every iteration
+ * that gets a status reading (before the lock check), so a caller can
+ * publish live signal stats (dvb_frontend_read_stats) as they become
+ * available rather than only once this returns — useful for a caller
+ * that wants /tunerN/status to reflect real progress during a slow
+ * lock attempt, not just the final result. Note this only helps for
+ * iterations that actually complete: some DVB drivers (confirmed
+ * lgdt3306a) can block for several seconds *inside a single
+ * FE_READ_STATUS call itself* on a marginal/dead frequency, during
+ * which no callback fires at all — there's no way to get partial
+ * progress out of a syscall that hasn't returned yet. */
+bool dvb_frontend_wait_lock(int fd, int timeout_ms, dvb_frontend_progress_cb cb, void *cb_ctx);
 
 /* Reads current signal stats via the S2API DTV_STAT_* properties. Safe
  * to call whether or not locked (has_lock reflects current state; other
