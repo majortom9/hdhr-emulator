@@ -233,12 +233,34 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
              * at least one live reading for the frequency we're
              * currently on — report it instead of the bare placeholder
              * below, same reasoning as the streaming branch above (see
-             * tuner.h's scan_stats comment). */
+             * tuner.h's scan_stats comment).
+             *
+             * The lock=/none word itself comes from t->status, NOT
+             * stats->has_lock: stats is only refreshed every
+             * PROGRESS_CB_INTERVAL_MS (250ms, see dvb_frontend.c), so
+             * right at the moment a channel actually achieves lock,
+             * there's a window where the authoritative result (set by
+             * finalize_lock_result once dvb_scan_tune_and_lock's own
+             * loop returns) already says locked but the last-published
+             * stats snapshot hasn't caught up yet — confirmed live: a
+             * client saw "lock=none ss=97 snq=70" for a channel that
+             * had, in fact, already locked. t->status is updated
+             * exactly once the real result is known (see
+             * handle_tuner_set/finalize_lock_result), so it's the
+             * correct source for this word; scan_stats remains the
+             * right source for ss=/snq=/seq= specifically, which are
+             * meant to be best-effort/live rather than a single final
+             * answer. */
             struct dvb_signal_stats *stats = &t->scan_stats;
+            char lock_word[32] = "none";
+            const char *lock_field = strstr(t->status, "lock=");
+            if (lock_field) {
+                sscanf(lock_field + 5, "%31s", lock_word);
+            }
             snprintf(val, sizeof(val),
                      "ch=%s lock=%s ss=%d snq=%d seq=%d",
                      t->channel,
-                     stats->has_lock ? "8vsb" : "none",
+                     lock_word,
                      stats->signal_strength_pct < 0 ? 0 : stats->signal_strength_pct,
                      stats->snr_quality_pct < 0 ? 0 : stats->snr_quality_pct,
                      stats->symbol_quality_pct < 0 ? 0 : stats->symbol_quality_pct);
@@ -355,6 +377,13 @@ static void finalize_lock_result(struct hdhr_tuner *t, uint32_t freq, bool locke
 struct scan_progress_ctx {
     struct hdhr_tuner *t;
     uint32_t freq;
+    /* Fresh per attempt (declared inside channel_scan_thread_main's
+     * loop, so a new frequency never inherits a previous one's window)
+     * — see dvb_frontend_legacy_seq_pct()'s own comment for why this is
+     * needed at all: this driver doesn't populate the modern DVBv5
+     * error-block stats, so symbol_quality_pct is otherwise always -1
+     * during a scan. */
+    struct dvb_legacy_seq_state legacy_seq;
 };
 
 /* Called from dvb_frontend_wait_lock()'s poll loop, on the scan
@@ -370,6 +399,21 @@ static void publish_scan_stats(void *ctx, int fd)
     struct scan_progress_ctx *pc = ctx;
     struct dvb_signal_stats stats;
     dvb_frontend_read_stats(fd, &stats);
+
+    if (stats.symbol_quality_pct < 0) {
+        /* Modern DVBv5 block-count stats unavailable on this driver
+         * (confirmed lgdt3306a) — fall back to the legacy
+         * FE_READ_UNCORRECTED_BLOCKS-based estimate, same as the
+         * streaming path already does (see handle_tuner_get's /status
+         * handler). This matters beyond cosmetics: libhdhomerun's own
+         * channelscan_find_lock() waits up to 5s for
+         * symbol_error_quality to reach 100 after achieving basic lock
+         * before it'll even start checking for programs — without a
+         * real seq= here, that 5s wait was unconditional on *every*
+         * locked channel, since seq= stayed 0 the entire time. */
+        int legacy_pct = dvb_frontend_legacy_seq_pct(fd, &pc->legacy_seq);
+        if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
+    }
 
     tuner_lock(pc->t);
     pc->t->scan_stats = stats;
@@ -405,6 +449,24 @@ static void *channel_scan_thread_main(void *arg)
         }
 
         if (locked) {
+            /* Give the legacy uncorrected-blocks counter a real window
+             * to measure before PSIP reading closes this fd.
+             * publish_scan_stats() during the wait-for-lock loop above
+             * only ever gets one sample in the common (fast-locking)
+             * case, since polling stops the instant FE_HAS_LOCK is
+             * detected — not enough for
+             * dvb_frontend_legacy_seq_pct()'s windowed calculation
+             * (needs >=0.5s between two samples on the same state).
+             * Confirmed live: without this, seq= stayed 0 indefinitely
+             * even on a strongly-locked channel, since polling simply
+             * never continued long enough to form a window. A short
+             * deliberate pause here gives libhdhomerun's own
+             * channelscan_find_lock() a real seq= to check instead of
+             * always burning its full 5-second "settle" timeout. */
+            publish_scan_stats(&pc, ffd);
+            usleep(600 * 1000);
+            publish_scan_stats(&pc, ffd);
+
             dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, rf_channel, freq, ffd);
         }
 

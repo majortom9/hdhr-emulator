@@ -298,6 +298,51 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
     }
 }
 
+/* ATSC 8VSB segment rate — see dvb_stream.c's own copy of this same
+ * constant (used identically there for the streaming-time version of
+ * this calculation) for the full derivation; duplicated here rather
+ * than shared to avoid touching that already-verified code for this
+ * unrelated scan-time addition. */
+#define ATSC_SEGMENTS_PER_SEC 12935.38
+
+int dvb_frontend_legacy_seq_pct(int fd, struct dvb_legacy_seq_state *state)
+{
+    uint32_t ucblocks;
+    if (!dvb_frontend_read_legacy_ucblocks(fd, &ucblocks)) {
+        return -1;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (!state->have_baseline) {
+        state->have_baseline = true;
+        state->last_ucblocks = ucblocks;
+        state->last_time = now;
+        state->last_pct = -1;
+        return -1; /* no window yet — next call will have one */
+    }
+
+    double elapsed = (now.tv_sec - state->last_time.tv_sec) +
+                      (now.tv_nsec - state->last_time.tv_nsec) / 1e9;
+    if (elapsed < 0.5) {
+        return state->last_pct;
+    }
+
+    uint32_t delta_blocks = (ucblocks >= state->last_ucblocks) ?
+                             (ucblocks - state->last_ucblocks) : 0;
+    double expected_blocks = ATSC_SEGMENTS_PER_SEC * elapsed;
+    double error_ratio = expected_blocks > 0 ? (delta_blocks / expected_blocks) : 0.0;
+    int pct = (int)((1.0 - error_ratio) * 100.0 + 0.5);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    state->last_ucblocks = ucblocks;
+    state->last_time = now;
+    state->last_pct = pct;
+    return pct;
+}
+
 bool dvb_frontend_read_legacy_ucblocks(int fd, uint32_t *out_ucblocks)
 {
     uint32_t val = 0;

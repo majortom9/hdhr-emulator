@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 
 struct dvb_signal_stats {
     bool has_lock;
@@ -64,5 +65,29 @@ void dvb_frontend_set_debug(bool enabled);
  * windowed-rate caller for how the denominator is derived instead).
  * Returns false if this ioctl isn't supported either. */
 bool dvb_frontend_read_legacy_ucblocks(int fd, uint32_t *out_ucblocks);
+
+/* Windowed baseline state for dvb_frontend_legacy_seq_pct() — owned by
+ * the caller, persisted across repeated calls for the same tuning
+ * attempt (zero-initialize before first use, e.g. via `= {0}` on a
+ * fresh struct per attempt so a previous frequency's counts never leak
+ * into a new one's). */
+struct dvb_legacy_seq_state {
+    bool             have_baseline;
+    uint32_t         last_ucblocks;
+    struct timespec  last_time;
+    int              last_pct;
+};
+
+/* Same idea as dvb_stream.c's dvb_stream_get_legacy_seq_pct() (windowed
+ * post-FEC quality estimate from the cumulative
+ * FE_READ_UNCORRECTED_BLOCKS counter, for drivers — confirmed
+ * lgdt3306a — that don't populate the modern DVBv5 block-count stats),
+ * but taking plain state instead of a struct dvb_stream so it can also
+ * be used outside an active stream (e.g. control.c's live scan-progress
+ * reporting). Needs at least two calls on the same *state spaced >=0.5s
+ * apart before returning a real value (matches
+ * dvb_stream_get_legacy_seq_pct's own settle behavior) — returns -1
+ * until then, or if the ioctl isn't supported at all. */
+int dvb_frontend_legacy_seq_pct(int fd, struct dvb_legacy_seq_state *state);
 
 #endif /* HDHR_DVB_FRONTEND_H */
