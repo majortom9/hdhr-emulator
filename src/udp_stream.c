@@ -115,16 +115,38 @@ int udp_push_start(const struct hdhr_config *cfg, struct hdhr_tuner *t,
     udp_push_stop(t); /* only one push per tuner at a time */
 
     tuner_lock(t);
-    if (!t->vch_resolved) {
+    const struct dvb_channel *ch = NULL;
+    if (t->vch_resolved) {
+        ch = dvb_find_channel(t->vch_major, t->vch_minor);
+        if (!ch) {
+            tuner_unlock(t);
+            fprintf(stderr, "udp_stream: tuner%d: resolved channel %d.%d no longer in the "
+                             "channel database (rescanned since?)\n", t->index, t->vch_major, t->vch_minor);
+            return -1;
+        }
+    } else if (t->tuned_frequency_hz != 0) {
+        /* No named virtual channel selected (e.g. a raw /tunerN/channel
+         * RF tune rather than /tunerN/vchannel) — real usage streams
+         * directly off channel+program in this case (a manual RF
+         * tune + explicit program number, or program=0 for full-mux
+         * passthrough, neither of which needs PSIP name resolution).
+         * Any channel already known on this mux works as the base
+         * dvb_stream_open() struct: it only supplies the PAT/PMT/PID
+         * lookup starting point, and dvb_stream_open() itself resolves
+         * program_override against the mux's siblings (or ignores the
+         * base entirely for program=0's full-mux passthrough). */
+        const struct dvb_channel *siblings[DVB_CHANNEL_MAX];
+        int n = dvb_channels_on_freq(t->tuned_frequency_hz, siblings, DVB_CHANNEL_MAX);
+        if (n > 0) ch = siblings[0];
+        if (!ch) {
+            tuner_unlock(t);
+            fprintf(stderr, "udp_stream: tuner%d: no channels known on %u Hz "
+                             "(scan it first via /tunerN/channel)\n", t->index, t->tuned_frequency_hz);
+            return -1;
+        }
+    } else {
         tuner_unlock(t);
-        fprintf(stderr, "udp_stream: tuner%d: no channel resolved, refusing target= push\n", t->index);
-        return -1;
-    }
-    const struct dvb_channel *ch = dvb_find_channel(t->vch_major, t->vch_minor);
-    if (!ch) {
-        tuner_unlock(t);
-        fprintf(stderr, "udp_stream: tuner%d: resolved channel %d.%d no longer in the "
-                         "channel database (rescanned since?)\n", t->index, t->vch_major, t->vch_minor);
+        fprintf(stderr, "udp_stream: tuner%d: no channel/frequency set, refusing target= push\n", t->index);
         return -1;
     }
 
