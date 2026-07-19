@@ -100,8 +100,8 @@ static void *push_thread_main(void *arg)
 
     close(sock);
 
-    fprintf(stderr, "udp_stream: tuner%d: push stopped (%llu TS packets sent)\n",
-            t->index, (unsigned long long)packets_sent);
+    fprintf(stderr, "udp_stream: tuner%d: push stopped (%llu TS packets, %llu bytes sent)\n",
+            t->index, (unsigned long long)packets_sent, (unsigned long long)bytes_sent);
 
     tuner_release(t); /* closes ds internally */
 done_no_claim:
