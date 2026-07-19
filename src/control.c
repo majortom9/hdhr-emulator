@@ -85,6 +85,11 @@ struct conn_ctx {
     struct control_ctx *ctl;
 };
 
+/* Set once at the top of control_thread_main() (the first thread main()
+ * starts) — good enough approximation of daemon start for /sys/debug's
+ * cosmetic uptime figure, not meant to be to-the-millisecond precise. */
+static time_t g_start_time;
+
 static ssize_t read_full(int fd, void *buf, size_t len)
 {
     size_t got = 0;
@@ -151,10 +156,43 @@ static int parse_udp_target(const char *value, char *ip_out, size_t ip_out_len, 
     return 0;
 }
 
+/* /sys/8vsb_override's stored value — cosmetic only, since dvb_frontend.c
+ * always requests VSB_8 regardless (this project's scope is US-OTA
+ * 8VSB only; see atsc_freq.h). Real firmware uses this to force 8VSB
+ * on marginal signals where auto-modulation detection picks the wrong
+ * standard, which isn't a distinction that applies to us. Accepted and
+ * echoed back so clients that unconditionally read/restore it (e.g. a
+ * config-backup script) don't get an error, but it has no effect on
+ * tuning. Device-wide, not per-tuner, matching the real leaf's own
+ * /sys/ (not /tunerN/) scope. */
+static char g_8vsb_override[32] = "none";
+
 static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *name, const char *leaf)
 {
     if (strcmp(leaf, "model") == 0) {
+        /* Confirmed against a genuine HDHomeRun3 (2026-07-19): /sys/model
+         * over the control protocol returns the firmware codename
+         * ("hdhomerun3_atsc"), not the marketing model number
+         * ("HDHR3-US") — that's /sys/hwmodel instead. http_server.c's
+         * discovery.json already keeps these straight (ModelNumber vs
+         * FirmwareName); this GETSET leaf previously returned cfg->model
+         * here, which was backwards relative to real firmware. */
+        send_value_reply(fd, name, cfg->firmware_name);
+    } else if (strcmp(leaf, "hwmodel") == 0) {
         send_value_reply(fd, name, cfg->model);
+    } else if (strcmp(leaf, "8vsb_override") == 0) {
+        send_value_reply(fd, name, g_8vsb_override);
+    } else if (strcmp(leaf, "debug") == 0) {
+        /* Real firmware's /sys/debug dumps internal hardware counters
+         * (memory pool stats, per-tuner PLL calibration, Ethernet link
+         * state) that don't correspond to anything this daemon
+         * actually tracks — fabricating plausible-looking fake values
+         * for them would be worse than not having this leaf at all.
+         * Report genuine process-level info instead. */
+        char val[128];
+        snprintf(val, sizeof(val), "pid=%d uptime=%lds", (int)getpid(),
+                 (long)(time(NULL) - g_start_time));
+        send_value_reply(fd, name, val);
     } else if (strcmp(leaf, "version") == 0) {
         send_value_reply(fd, name, cfg->firmware_version);
     } else if (strcmp(leaf, "features") == 0) {
@@ -179,6 +217,18 @@ static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *na
     } else {
         send_error_reply(fd, name, "ERROR: parameter is read-only or unknown");
     }
+}
+
+static void handle_sys_set(int fd, const struct hdhr_config *cfg, const char *name,
+                            const char *leaf, const char *value)
+{
+    (void)cfg;
+    if (strcmp(leaf, "8vsb_override") == 0) {
+        snprintf(g_8vsb_override, sizeof(g_8vsb_override), "%s", value);
+        send_value_reply(fd, name, g_8vsb_override);
+        return;
+    }
+    send_error_reply(fd, name, "ERROR: parameter is read-only or unknown");
 }
 
 static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, const char *leaf)
@@ -298,6 +348,16 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                 }
             }
         }
+    } else if (strcmp(leaf, "debug") == 0) {
+        /* Real firmware's /tunerN/debug dumps hardware-level counters
+         * (DMA/queue stats, PLL calibration, transport-stream error
+         * tallies) this daemon doesn't track — see /sys/debug's own
+         * comment for why fabricating those would be worse than
+         * omitting them. Report the state we actually have instead:
+         * the same summary /tunerN/status already tracks, plus fields
+         * status doesn't surface (busy/program/target). */
+        snprintf(val, sizeof(val), "%s program=%d target=%s busy=%d",
+                 t->status, t->program, t->target, t->busy ? 1 : 0);
     } else {
         tuner_unlock(t);
         send_error_reply(fd, name, "ERROR: parameter is write-only or unknown");
@@ -797,9 +857,36 @@ static void dispatch_getset(struct conn_ctx *cctx, const char *name, int have_va
     struct hdhr_config *cfg = cctx->ctl->cfg;
     struct hdhr_tuner *tuners = cctx->ctl->tuners;
 
+    /* "help" (bare, no /sys/ or /tunerN/ prefix) — confirmed against a
+     * genuine HDHomeRun3's actual `get help` response (2026-07-19): a
+     * "Supported configuration options:" header followed by one path
+     * per line. Only meaningful as a GET; a hypothetical `set help ...`
+     * falls through to the unknown-parameter path below like any other
+     * unrecognized item. */
+    if (!have_value && strcmp(name, "help") == 0) {
+        send_value_reply(cctx->fd, name,
+            "Supported configuration options:\n"
+            "/sys/8vsb_override\n"
+            "/sys/debug\n"
+            "/sys/features\n"
+            "/sys/hwmodel\n"
+            "/sys/model\n"
+            "/sys/version\n"
+            "/tuner<n>/channel <modulation>:<freq|ch>\n"
+            "/tuner<n>/channelmap <channelmap>\n"
+            "/tuner<n>/debug\n"
+            "/tuner<n>/lockkey\n"
+            "/tuner<n>/program <program number>\n"
+            "/tuner<n>/status\n"
+            "/tuner<n>/streaminfo\n"
+            "/tuner<n>/target <ip>:<port>\n"
+            "/tuner<n>/vchannel <major.minor>\n");
+        return;
+    }
+
     if (strncmp(name, "/sys/", 5) == 0) {
         if (have_value) {
-            send_error_reply(cctx->fd, name, "ERROR: parameter is read-only");
+            handle_sys_set(cctx->fd, cfg, name, name + 5, value);
         } else {
             handle_sys_get(cctx->fd, cfg, name, name + 5);
         }
@@ -888,6 +975,7 @@ static void *conn_thread_main(void *arg)
 void *control_thread_main(void *arg)
 {
     struct control_ctx *ctl = (struct control_ctx *)arg;
+    g_start_time = time(NULL);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
