@@ -18,6 +18,14 @@ Linux DVB ioctl usage (frontend tuning, demux PID filters) is written
 and compile-checked directly against the real kernel headers
 (`linux/dvb/frontend.h`, `linux/dvb/dmx.h`).
 
+**Validated on real hardware** (Raspberry Pi 3B+, USB ATSC tuner,
+`lgdt3306a` demodulator, live off-air antenna) — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the technical detail behind the
+non-obvious parts of the design, most of which exist because of specific
+things discovered during that testing (a demodulator driver quirk, real
+client-side timing assumptions in `libhdhomerun`, an ambiguous wire-format
+detail in `hdhomerun_config_gui`'s own manual channel control).
+
 ## Architecture
 
 ```
@@ -82,16 +90,20 @@ GETSET reply. This mirrors genuine hardware's real physical constraint
 (N tuners = N concurrent streams, no more) — it's not an artificial
 limitation.
 
-## The one part most likely to need a fix on real hardware: TVCT parsing
+## TVCT parsing — validated, but still the part most likely to need a fix in a new market
 
 `psip.c` implements the ATSC A/65 TVCT (terrestrial virtual channel
-table) byte layout from the published field structure, and it's been
-verified with a **self-consistent round-trip test**
-(`make test` / `test/psip_test.c`) — a synthetic TVCT section is encoded
-by hand and confirmed to parse back to the same values. That test
-**cannot** catch a shared misunderstanding between the encoder and
-decoder, since I wrote both from the same understanding of the spec. It
-has **not** been validated against a real off-air ATSC capture.
+table) byte layout from the published field structure. It's both
+**self-consistently round-trip tested** (`make test` /
+`test/psip_test.c` — a synthetic TVCT section is encoded by hand and
+confirmed to parse back to the same values) and **validated against real
+off-air PSIP** in one market (dozens of real channels scanned in with
+correct major.minor numbers and names). The self-test alone couldn't
+catch a shared misunderstanding between the encoder and decoder, since
+both were written from the same understanding of the spec — real-hardware
+testing is what actually confirms the decoder side is right, and it has
+been, but only against one broadcast market's specific PSIP encoder
+behavior so far.
 
 If real channel numbers/names come back wrong, empty, or `dvb_scan`
 logs "TVCT" parse failures on a mux where you know PSIP is present,
@@ -116,26 +128,37 @@ values are the genuine ones, not guessed):
 - `device_id.c` — HDHomeRun device-ID checksum (see earlier project
   history / `--gen-device-id`)
 
-**NOT yet tested against real hardware** — this whole DVB-direct
-rewrite has not been run against an actual USB ATSC tuner, actual
-off-air signal, or a real client app. Specific things worth verifying
-first:
-1. `dvb_frontend_tune_8vsb()` actually achieves lock on your tuner's
-   driver (some older/rarer chipsets have quirks not covered by the
-   generic S2API path used here).
-2. TVCT parsing against your local broadcasters' real PSIP (see above).
-3. `DMX_SET_PES_FILTER` + multiple filters feeding one `/dev/dvb/adapterN/dvr0`
-   actually interleaves cleanly on your driver — this is standard,
-   well-supported DVB API behavior, but driver quality varies.
-4. The `FULL_MUX_PID` (`0x2000`) wildcard-PID trick for `program=0`
-   full-mux passthrough — documented DVB API behavior, but not every
-   driver honors it identically.
-5. Signal-stat scaling in `dvb_frontend_read_stats()` (the ss/snq/seq
-   percentages) is a reasonable-effort approximation, not calibrated
-   against your specific tuner's actual dB/relative-scale conventions —
-   real HDHomeRun firmware's own numbers are similarly
-   driver/hardware-dependent, so don't expect an exact match to a real
-   unit even once everything else is verified.
+**Validated against real hardware** (Raspberry Pi 3B+, USB ATSC tuner,
+`lgdt3306a` demodulator, live off-air antenna, real clients including
+`hdhomerun_config`/`hdhomerun_config_gui` — both the pi's installed copy
+and a freshly-built-from-GitHub latest release, and independently
+cross-checked against a raw `tune-s2` run):
+1. `dvb_frontend_tune_8vsb()` achieves lock reliably. This specific
+   driver has a real quirk worth knowing about if you hit it on other
+   hardware: `lgdt3306a`'s internal search() retries a lock *inside a
+   single blocking ioctl call*, in an uninterruptible kernel sleep, for
+   up to several seconds on a dead frequency — confirmed via `dmesg` and
+   `/proc/<tid>/stat`. Not abortable from userspace by any means. See
+   [ARCHITECTURE.md](ARCHITECTURE.md) §4 for how the control protocol is
+   designed around this.
+2. TVCT parsing works correctly against real off-air PSIP — dozens of
+   real channels scan in with correct major.minor numbers and names,
+   cross-checked against known local broadcasts.
+3. `DMX_SET_PES_FILTER` + multiple filters feeding one
+   `/dev/dvb/adapterN/dvr0` interleaves cleanly.
+4. Full-mux passthrough (`program=0`) not yet independently re-verified
+   after the DVB-direct rewrite's later fixes — the mechanism itself
+   (`0x2000` wildcard PID) is unchanged and was working in earlier
+   testing.
+5. Signal-stat scaling in `dvb_frontend_read_stats()` (ss/snq/seq) is
+   calibrated against this specific driver's actual dB/relative-scale
+   conventions (see the calibration comments in `dvb_frontend.c`) and
+   independently cross-checked against a raw `tune-s2` reading of the
+   same hardware (-50.0 dBm / 24.4 dB SNR mapped to ~97%/~70% via the
+   calibration formulas, matching live `/tunerN/status` readings almost
+   exactly). Different tuner hardware will need its own calibration pass
+   the same way — the formulas' min/max reference points are
+   driver-specific, not universal.
 
 ## Build
 
@@ -212,24 +235,33 @@ test/
   psip_test.c          PAT/PMT/TVCT round-trip self-test (make test)
 config/                example config
 systemd/                service unit
+ARCHITECTURE.md         deeper technical detail — the "why" behind the
+                         non-obvious parts of the design (see especially
+                         if you're touching control.c's channel-SET
+                         handling or dvb_frontend.c's stat reporting)
 ```
 
 ## Known simplifications
 
-- **`/tunerN/channel` SET is a best-effort peek at tuner busy-state, not a
-  full claim** — it refuses if the tuner is actively streaming, but
-  there's a small race window against a concurrent claim from another
-  client. Fine for a single-household LAN tool.
-- **`seq` (symbol quality) may read 0% on some tuner chipsets** if the
-  driver doesn't populate `DTV_STAT_ERROR_BLOCK_COUNT`/
-  `DTV_STAT_TOTAL_BLOCK_COUNT` (confirmed common on several USB ATSC
-  demod ICs) — this shows as unavailable rather than a false "0 errors",
-  but still displays as 0 in `hdhomerun_config_gui` since the real
-  protocol has no distinct "unavailable" value in that field. Check with
-  `debug_signal_stats=1` — if you see `error_block_count`/
-  `total_block_count` debug lines at all, the stat is supported and any
-  remaining 0% is worth investigating further; if those lines never
-  appear, it's a driver limitation, not a bug here.
+- **`/tunerN/channel` SET refuses immediately only if a live stream is
+  active** — if it's busy because of another channel scan already in
+  flight, the new request queues (a bounded FIFO) and gets picked up by
+  the same in-flight background worker rather than refusing or blocking.
+  See [ARCHITECTURE.md](ARCHITECTURE.md) §4 for the full design and why
+  it's this complicated (short version: a real driver quirk on the
+  hardware this was developed against, colliding with real client-side
+  timeout assumptions in `libhdhomerun`).
+- **`seq` (symbol quality) falls back to a legacy calculation** on
+  drivers that don't populate the modern `DTV_STAT_ERROR_BLOCK_COUNT`/
+  `DTV_STAT_TOTAL_BLOCK_COUNT` stats (confirmed the case for this
+  project's `lgdt3306a` driver, and common on other USB ATSC demod ICs) —
+  a windowed calculation off the legacy cumulative
+  `FE_READ_UNCORRECTED_BLOCKS` counter instead, both while actively
+  streaming and during a channel scan (see
+  [ARCHITECTURE.md](ARCHITECTURE.md) §5). If your driver doesn't support
+  *either* the modern or legacy stat, `seq=0` is a real
+  driver limitation, not a bug here — check with `debug_signal_stats=1`
+  to see which case you're in.
 
 - **`lockkey`** is stored and reported but not enforced against
   concurrent writers. Fine for a single-household LAN tool.
@@ -240,7 +272,8 @@ systemd/                service unit
 - **8VSB (US OTA) only** — no QAM/cable support, per project scope.
 - **Program=0 full-mux passthrough** relies on the DVB API's `0x2000`
   wildcard PID, which is common but not universally implemented
-  identically across every driver — see "what's not yet tested" above.
+  identically across every driver — see "What's compile-verified vs.
+  what needs real hardware" above.
 - **PSI isn't rewritten** — when filtering to one program, the original
   PAT (which may still list other programs whose PMTs/AV aren't
   actually present in the filtered output) passes through as-is rather
@@ -248,15 +281,26 @@ systemd/                service unit
   player tested against real-world partial-mux captures handles this
   fine in practice, but it's not spec-pure.
 
-## Next steps worth doing before relying on this
+## Next steps
 
-1. Point at a real USB ATSC tuner + antenna, watch the scan log, and
-   confirm channels actually appear with sane names/numbers.
-2. Cross-check a scanned channel's major.minor and name against what
-   your local stations actually broadcast (RabbitEars.info or similar
-   is a good independent reference for expected PSIP values in your
-   market).
-3. `ffprobe http://<pi-ip>/auto/v<major>.<minor>` — confirms the whole
-   PID-filter-through-DVR-capture path produces a decodable stream.
-4. Try discovery + a stream pull from a real client (Plex, Channels
-   DVR, `hdhomerun_config`) end to end.
+Done, via real-hardware testing (see [ARCHITECTURE.md](ARCHITECTURE.md)):
+pointing at a real tuner + antenna and confirming channels scan in with
+sane names/numbers; cross-checking scanned channels against known local
+broadcasts; discovery + manual channel control end to end via both
+`hdhomerun_config` and `hdhomerun_config_gui` (including the GUI's manual
+channel spinner and continuous scan-up/down controls).
+
+Still worth doing:
+1. `ffprobe http://<pi-ip>/auto/v<major>.<minor>` — confirms the whole
+   PID-filter-through-DVR-capture path produces a decodable stream (the
+   control-plane/scan side is now well-tested; the actual media pipeline
+   hasn't been re-verified since the later fixes).
+2. A stream pull through a real DVR client (Plex, Channels DVR,
+   Jellyfin) end to end, not just `hdhomerun_config`/`hdhomerun_config_gui`.
+3. Full-mux passthrough (`program=0`) re-verification (see "what's
+   compile-verified vs. what's real-hardware-validated" above).
+4. Wire up a runtime "trigger a rescan" control — `dvb_scan_run()`
+   already exists and does the right thing, it's just not reachable from
+   the control protocol yet (see "Known simplifications").
+5. Second-tuner (`tuner1`+) validation under real concurrent load — most
+   testing so far has exercised one physical adapter at a time.
