@@ -29,6 +29,8 @@
 #include "http_server.h"
 #include "dvb_scan.h"
 #include "dvb_frontend.h"
+#include "dvb_channel.h"
+#include "atsc_freq.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,10 @@
 static struct hdhr_config g_cfg;
 static struct hdhr_tuner  g_tuners[HDHR_MAX_TUNERS];
 
+/* How long a scan step waits to claim tuner0 before skipping that
+ * frequency for this pass — see the per-frequency claiming note below. */
+#define SCAN_STEP_CLAIM_WAIT_MS 5000
+
 /* Runs the initial (and, if scan_on_startup fires again later via a
  * future admin action, any subsequent) full ATSC scan in the
  * background so discovery/control/HTTP come up immediately rather than
@@ -48,26 +54,48 @@ static struct hdhr_tuner  g_tuners[HDHR_MAX_TUNERS];
  * — one physical tuner briefly does the scanning work for the whole
  * box, since the channel database is shared across all tuner slots.
  *
- * Claims tuner0 via tuner_try_claim() for the duration, same as any
- * other consumer of a physical tuner (HTTP pulls, target= pushes, a
- * manual /tunerN/channel SET) — without this, the startup scan and,
- * say, a `hdhomerun_config ... scan /tuner0` issued right after
- * restart would both try to open the same physical frontend device
- * concurrently. Since dvb_scan_run() bypasses the tuner abstraction
- * entirely (it drives the adapter/frontend/demux numbers directly),
- * that collision surfaced as a raw, confusing "Device or resource
- * busy" from the kernel rather than a clean "tuner busy" error. */
+ * Claims tuner0 per frequency (tuner_try_claim_wait, not
+ * tuner_try_claim), rather than once for the whole scan, so tuner0
+ * isn't a several-minutes-long dead zone for every other consumer of a
+ * physical tuner (HTTP pulls, target= pushes, a manual /tunerN/channel
+ * SET) right after every restart. An earlier version claimed once up
+ * front for the entire dvb_scan_run() call: correct in that it did
+ * prevent the startup scan and, say, a `hdhomerun_config ... scan
+ * /tuner0` issued right after restart from touching the same physical
+ * frontend device concurrently (dvb_scan_tune_and_lock/read_psip bypass
+ * the tuner abstraction entirely — they drive the adapter/frontend/demux
+ * numbers directly, so an uncoordinated collision there surfaces as a
+ * raw "Device or resource busy" from the kernel, not a clean "tuner
+ * busy" reply) — but holding the claim for the whole scan meant a
+ * request landing mid-scan could queue long enough for the client's own
+ * timeout to give up with a hard communication error before ever
+ * reaching that clean reply. Releasing between frequencies bounds the
+ * wait to one step instead. */
 static void *scan_thread_main(void *arg)
 {
     (void)arg;
-    if (!tuner_try_claim(&g_tuners[0])) {
-        fprintf(stderr, "main: tuner0 already in use at startup — skipping the "
-                         "initial scan (unusual this early; if this persists, "
-                         "something else is holding the tuner)\n");
-        return NULL;
+    dvb_channel_db_clear();
+    fprintf(stderr, "dvb_scan: starting full scan on adapter%d (this takes a couple minutes)\n",
+             g_cfg.dvb_adapter[0]);
+
+    int total = 0;
+    for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
+        if (!tuner_try_claim_wait(&g_tuners[0], SCAN_STEP_CLAIM_WAIT_MS)) {
+            fprintf(stderr, "dvb_scan: tuner0 busy, skipping %u Hz this pass\n",
+                    atsc_freq_table[i].frequency_hz);
+            continue;
+        }
+        int ffd;
+        if (dvb_scan_tune_and_lock(g_cfg.dvb_adapter[0], g_cfg.dvb_frontend,
+                                    atsc_freq_table[i].frequency_hz, &ffd)) {
+            total += dvb_scan_read_psip(g_cfg.dvb_adapter[0], g_cfg.dvb_demux,
+                                         atsc_freq_table[i].channel,
+                                         atsc_freq_table[i].frequency_hz, ffd);
+        }
+        tuner_release(&g_tuners[0]);
     }
-    dvb_scan_run(g_cfg.dvb_adapter[0], g_cfg.dvb_frontend, g_cfg.dvb_demux);
-    tuner_release(&g_tuners[0]);
+
+    fprintf(stderr, "dvb_scan: complete — %d virtual channel(s) found\n", total);
     return NULL;
 }
 
