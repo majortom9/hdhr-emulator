@@ -168,9 +168,21 @@ static int parse_udp_target(const char *value, char *ip_out, size_t ip_out_len, 
  * /sys/ (not /tunerN/) scope. */
 static char g_8vsb_override[32] = "none";
 
+/* Deliberately our own wording, not a copy of real firmware's actual
+ * value (a literal Silicondust copyright notice) — echoing that back
+ * would misattribute this project's own independently-written,
+ * clean-room code (see README.md), a different kind of claim than the
+ * wire-protocol mimicry the rest of this daemon does. */
+#define HDHR_EMULATOR_COPYRIGHT \
+    "hdhr-emulator — independent, clean-room HDHomeRun-protocol-compatible " \
+    "emulator (github.com/majortom9/hdhr-emulator). Not Silicondust software; " \
+    "not affiliated with or endorsed by SiliconDust USA Inc."
+
 static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *name, const char *leaf)
 {
-    if (strcmp(leaf, "model") == 0) {
+    if (strcmp(leaf, "copyright") == 0) {
+        send_value_reply(fd, name, HDHR_EMULATOR_COPYRIGHT);
+    } else if (strcmp(leaf, "model") == 0) {
         /* Confirmed against a genuine HDHomeRun3 (2026-07-19): /sys/model
          * over the control protocol returns the firmware codename
          * ("hdhomerun3_atsc"), not the marketing model number
@@ -979,6 +991,7 @@ static void dispatch_getset(struct conn_ctx *cctx, const char *name, int have_va
         send_value_reply(cctx->fd, name,
             "Supported configuration options:\n"
             "/sys/8vsb_override\n"
+            "/sys/copyright\n"
             "/sys/debug\n"
             "/sys/features\n"
             "/sys/hwmodel\n"
