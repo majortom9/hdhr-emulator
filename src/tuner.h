@@ -27,6 +27,7 @@ struct hdhr_tuner {
     int      index;
     int      adapter; /* physical /dev/dvb/adapterN, from config */
     pthread_mutex_t lock;
+    pthread_cond_t  free_cond; /* signaled by tuner_release(); see tuner_try_claim_wait() */
 
     char     channel[64];
     int      program;
@@ -67,6 +68,16 @@ void tuner_unlock(struct hdhr_tuner *t);
  * caller owns the tuner until tuner_release(); it's expected to open a
  * dvb_stream and store it via tuner_set_stream(). */
 bool tuner_try_claim(struct hdhr_tuner *t);
+
+/* Like tuner_try_claim(), but if the tuner is already busy, waits up to
+ * timeout_ms for it to free up (woken by tuner_release()) instead of
+ * failing immediately. Use this for requests that can reasonably queue
+ * behind whatever's currently using the tuner (e.g. a manual channel
+ * scan's next frequency, right behind the previous one's) rather than
+ * ones that should fail fast if the tuner isn't immediately available
+ * (e.g. a live stream request, which still wants tuner_try_claim()).
+ * Returns false if still busy after the timeout. */
+bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms);
 
 /* Records the dvb_stream now backing this (already-claimed) tuner, so
  * other code (e.g. status/streaminfo reporting) can see it. */

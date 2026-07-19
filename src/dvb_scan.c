@@ -92,24 +92,28 @@ static int read_tvct(int adapter, int demux_num, struct tvct_entry *out, int max
     return total;
 }
 
-static int scan_one_frequency(int adapter, int frontend, int demux_num, int rf_channel,
-                               uint32_t freq_hz, bool *out_locked)
+bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd)
 {
-    if (out_locked) *out_locked = false;
+    *out_ffd = -1;
 
     int ffd = dvb_frontend_open(adapter, frontend);
-    if (ffd < 0) return 0;
+    if (ffd < 0) return false;
 
     if (dvb_frontend_tune_8vsb(ffd, freq_hz) != 0) {
         dvb_frontend_close(ffd);
-        return 0;
+        return false;
     }
     if (!dvb_frontend_wait_lock(ffd, LOCK_TIMEOUT_MS)) {
         dvb_frontend_close(ffd); /* no signal on this frequency — normal, most will miss */
-        return 0;
+        return false;
     }
-    if (out_locked) *out_locked = true;
 
+    *out_ffd = ffd;
+    return true;
+}
+
+int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq_hz, int ffd)
+{
     fprintf(stderr, "dvb_scan: locked %u Hz, reading PAT/PMT/TVCT...\n", freq_hz);
 
     struct pat_entry pat[PAT_MAX_ENTRIES];
@@ -217,13 +221,6 @@ static int scan_one_frequency(int adapter, int frontend, int demux_num, int rf_c
     return added;
 }
 
-bool dvb_scan_frequency(int adapter, int frontend, int demux_num, int rf_channel, uint32_t freq_hz)
-{
-    bool locked = false;
-    scan_one_frequency(adapter, frontend, demux_num, rf_channel, freq_hz, &locked);
-    return locked;
-}
-
 int dvb_scan_run(int adapter, int frontend, int demux_num)
 {
     dvb_channel_db_clear();
@@ -231,9 +228,11 @@ int dvb_scan_run(int adapter, int frontend, int demux_num)
 
     int total = 0;
     for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
-        total += scan_one_frequency(adapter, frontend, demux_num,
-                                     atsc_freq_table[i].channel, atsc_freq_table[i].frequency_hz,
-                                     NULL);
+        int ffd;
+        if (dvb_scan_tune_and_lock(adapter, frontend, atsc_freq_table[i].frequency_hz, &ffd)) {
+            total += dvb_scan_read_psip(adapter, demux_num, atsc_freq_table[i].channel,
+                                         atsc_freq_table[i].frequency_hz, ffd);
+        }
     }
 
     fprintf(stderr, "dvb_scan: complete — %d virtual channel(s) found\n", total);

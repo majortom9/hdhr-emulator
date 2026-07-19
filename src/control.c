@@ -10,13 +10,23 @@
  *
  *   /sys/model, /sys/features, /sys/version        (read-only)
  *   /tunerN/channel    raw RF tune: "auto:<freq_hz>" | "8vsb:<freq_hz>" |
- *                      "us-bcast:<N>" | "none". Performs live PSIP
- *                      detection at tune time (dvb_scan_frequency, same
- *                      mechanism dvb_scan.c's startup scan uses) and
- *                      merges anything found into the shared channel
- *                      database — this is what backs hdhomerun_config's
- *                      own `scan` subcommand. Does not select a specific
- *                      virtual channel/program by itself.
+ *                      "us-bcast:<N>" | "none". Claims the tuner and
+ *                      tunes + performs live PSIP detection
+ *                      (dvb_scan_tune_and_lock + dvb_scan_read_psip,
+ *                      same mechanism dvb_scan.c's startup scan uses) in
+ *                      a detached background thread, merging anything
+ *                      found into the shared channel database — this is
+ *                      what backs hdhomerun_config's own `scan`
+ *                      subcommand. The SET reply waits up to
+ *                      CHANNEL_SET_WAIT_MS for just the lock result (not
+ *                      the full PSIP read) so a follow-up
+ *                      /tunerN/status poll sees it immediately in the
+ *                      common case, but won't block indefinitely — some
+ *                      DVB drivers can take far longer than that inside
+ *                      a single blocking ioctl on a dead frequency; see
+ *                      the comment at the SET handler's channel branch.
+ *                      Does not select a specific virtual
+ *                      channel/program by itself.
  *   /tunerN/channelmap GET-only, always "us-bcast" (8VSB/US-OTA only,
  *                      per project scope — SET is rejected)
  *   /tunerN/vchannel   set "<major>.<minor>" to select a channel found by
@@ -63,6 +73,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <errno.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -266,6 +278,85 @@ static bool parse_channel_value(const char *value, uint32_t *out_freq, int *out_
     return false;
 }
 
+/* Runs the RF tune + lock (dvb_scan_tune_and_lock) and, if locked, the
+ * PAT/PMT/TVCT read (dvb_scan_read_psip) for a /tunerN/channel SET in a
+ * background thread, so the SET reply isn't hostage to the DVB driver's
+ * worst-case blocking behavior on a dead frequency (see the comment at
+ * the SET handler's call site). The calling connection thread waits on
+ * `cond` for up to CHANNEL_SET_WAIT_MS for the *lock* result specifically
+ * (not the full PSIP read, which can legitimately take longer on a busy
+ * mux) so it can reply with an accurate lock status in the common case;
+ * `caller_gave_up` tells this thread whether it or the caller is
+ * responsible for finalizing tuner state and freeing this struct. */
+#define CHANNEL_SET_WAIT_MS 1800
+
+/* How long a /tunerN/channel SET will wait for a *previous* scan on the
+ * same tuner to release before giving up and reporting "busy". Bounded
+ * above the driver's own worst-case dead-frequency block (~10s observed)
+ * so back-to-back requests from a single scan (e.g. hdhomerun_config's
+ * `scan`) queue up and run in turn instead of cascading into refusals —
+ * see the comment at the SET handler's channel branch. */
+#define CHANNEL_CLAIM_WAIT_MS 12000
+
+struct channel_scan_ctx {
+    struct hdhr_tuner *t;
+    const struct hdhr_config *cfg;
+    int rf_channel;
+    uint32_t freq;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool lock_known;      /* set once dvb_scan_tune_and_lock returns */
+    bool locked;          /* valid once lock_known */
+    bool caller_gave_up;  /* set by the caller if it stopped waiting */
+};
+
+/* Finalizes tuner state after the lock result is known. Only touches
+ * status if the tuner is still on the frequency we scanned — if the
+ * client already moved on (another /channel SET, or a "none") while we
+ * were working, our result is stale and shouldn't clobber the current
+ * one. */
+static void finalize_lock_result(struct hdhr_tuner *t, uint32_t freq, bool locked)
+{
+    tuner_lock(t);
+    if (t->tuned_frequency_hz == freq) {
+        snprintf(t->status, sizeof(t->status), "ch=%s lock=%s", t->channel, locked ? "8vsb" : "none");
+    }
+    tuner_unlock(t);
+}
+
+static void *channel_scan_thread_main(void *arg)
+{
+    struct channel_scan_ctx *ctx = arg;
+    struct hdhr_tuner *t = ctx->t;
+
+    int ffd;
+    bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, ctx->freq, &ffd);
+
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->locked = locked;
+    ctx->lock_known = true;
+    bool must_finalize = ctx->caller_gave_up;
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->mutex);
+
+    if (must_finalize) {
+        /* The caller already replied without us — this thread now owns
+         * reporting the lock result once it's known. */
+        finalize_lock_result(t, ctx->freq, locked);
+    }
+
+    if (locked) {
+        dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, ctx->rf_channel, ctx->freq, ffd);
+    }
+
+    tuner_release(t);
+    pthread_mutex_destroy(&ctx->mutex);
+    pthread_cond_destroy(&ctx->cond);
+    free(ctx);
+    return NULL;
+}
+
 static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_tuner *t,
                               const char *name, const char *leaf, const char *value)
 {
@@ -323,29 +414,52 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         /* Real semantics: /tunerN/channel is a raw RF tune, independent
          * of any specific virtual channel/program selection — that
          * happens separately via vchannel or program. It performs live
-         * PSIP detection at tune time (dvb_scan_frequency), same as
-         * genuine firmware, which is what lets hdhomerun_config's own
-         * `scan` subcommand work. Since it needs the physical tuner
-         * briefly, claim it for the duration rather than just peeking
-         * at busy-state first — a peek-then-act check has a race window
-         * where another consumer (an HTTP pull, a target= push, or the
-         * startup scan) could grab the tuner between the check and the
-         * actual scan. Released immediately after the scan completes,
-         * since a raw tune doesn't want to permanently occupy the slot
-         * the way an actual stream does. */
-        if (!tuner_try_claim(t)) {
+         * PSIP detection at tune time (dvb_scan_tune_and_lock +
+         * dvb_scan_read_psip), same as genuine firmware, which is what
+         * lets hdhomerun_config's own `scan` subcommand work.
+         *
+         * Claiming waits (tuner_try_claim_wait, not tuner_try_claim) up
+         * to CHANNEL_CLAIM_WAIT_MS rather than failing instantly if
+         * another /tunerN/channel scan on this tuner is still in
+         * progress: a manual scan sends its next channel's SET as soon
+         * as it gets *any* reply for the current one (it doesn't back
+         * off on "busy"), so an instant refusal here previously
+         * cascaded into every remaining channel failing once one
+         * request ran long — see the tune+scan comment below for why a
+         * single request can legitimately run long. Waiting instead
+         * lets back-to-back requests queue up and run in turn, matching
+         * how one physical tuner actually behaves. A live-stream request
+         * (http_server.c) still uses plain tuner_try_claim() and fails
+         * fast, since there's no reason for a viewer to queue behind an
+         * unrelated scan.
+         *
+         * The tune+scan itself runs in a detached background thread
+         * (channel_scan_thread_main) rather than blocking this reply on
+         * the whole thing: the DVB demod driver can legitimately block
+         * *inside a single ioctl* for several seconds on a dead
+         * frequency (e.g. lgdt3306a's search() retries the lock
+         * internally ~4x before giving up), which is also why
+         * CHANNEL_CLAIM_WAIT_MS above is generous. But replying before
+         * the lock is known isn't right either — hdhomerun_config checks
+         * /tunerN/status right after a SET returns, so we separately
+         * wait up to CHANNEL_SET_WAIT_MS for just the *lock* result
+         * (comfortably above the ~2s a real lock+PSIP read takes,
+         * comfortably below the driver's dead-frequency worst case) so
+         * the common case still reports an accurate lock status
+         * immediately; past that budget we reply with what we've got
+         * and let the background thread finish and update status
+         * whenever it's actually done. channel_scan_thread_main() owns
+         * releasing the claim taken here once the scan finishes. */
+        if (!tuner_try_claim_wait(t, CHANNEL_CLAIM_WAIT_MS)) {
             tuner_lock(t);
             bool has_active_stream = (t->active_stream != NULL);
             tuner_unlock(t);
-            fprintf(stderr, "control: tuner%d/channel SET to %s refused — tuner already claimed "
-                             "(active_stream=%s)\n", t->index, value, has_active_stream ? "yes" : "no");
+            fprintf(stderr, "control: tuner%d/channel SET to %s refused — tuner still claimed "
+                             "after waiting %dms (active_stream=%s)\n",
+                             t->index, value, CHANNEL_CLAIM_WAIT_MS, has_active_stream ? "yes" : "no");
             send_error_reply(fd, name, "ERROR: tuner busy (currently streaming or scanning)");
             return;
         }
-
-        bool locked = dvb_scan_frequency(t->adapter, cfg->dvb_frontend, cfg->dvb_demux,
-                                          rf_channel, freq);
-        tuner_release(t);
 
         tuner_lock(t);
         t->tuned_frequency_hz = freq;
@@ -355,8 +469,51 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         } else {
             snprintf(t->channel, sizeof(t->channel), "auto:%u", freq);
         }
-        snprintf(t->status, sizeof(t->status), "ch=%s lock=%s", t->channel, locked ? "8vsb" : "none");
+        snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
         tuner_unlock(t);
+
+        struct channel_scan_ctx *ctx = malloc(sizeof(*ctx));
+        ctx->t = t;
+        ctx->cfg = cfg;
+        ctx->rf_channel = rf_channel;
+        ctx->freq = freq;
+        pthread_mutex_init(&ctx->mutex, NULL);
+        pthread_cond_init(&ctx->cond, NULL);
+        ctx->lock_known = false;
+        ctx->locked = false;
+        ctx->caller_gave_up = false;
+
+        pthread_t th;
+        if (pthread_create(&th, NULL, channel_scan_thread_main, ctx) != 0) {
+            fprintf(stderr, "control: tuner%d/channel: failed to start scan thread\n", t->index);
+            pthread_mutex_destroy(&ctx->mutex);
+            pthread_cond_destroy(&ctx->cond);
+            free(ctx);
+            tuner_release(t); /* don't leave the tuner claimed forever if we can't scan */
+            send_value_reply(fd, name, t->channel);
+            return;
+        }
+        pthread_detach(th);
+
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += CHANNEL_SET_WAIT_MS / 1000;
+        deadline.tv_nsec += (long)(CHANNEL_SET_WAIT_MS % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_nsec -= 1000000000L;
+            deadline.tv_sec += 1;
+        }
+
+        pthread_mutex_lock(&ctx->mutex);
+        while (!ctx->lock_known) {
+            if (pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &deadline) == ETIMEDOUT) break;
+        }
+        bool have_result = ctx->lock_known;
+        bool locked_result = ctx->locked;
+        if (!have_result) ctx->caller_gave_up = true;
+        pthread_mutex_unlock(&ctx->mutex);
+
+        if (have_result) finalize_lock_result(t, freq, locked_result);
 
         send_value_reply(fd, name, t->channel);
         return;
