@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <linux/dvb/frontend.h>
 
@@ -61,18 +62,59 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
     return 0;
 }
 
+/* How often the (potentially expensive) progress callback actually
+ * fires, vs. how often we poll FE_READ_STATUS (step_ms). Calling it on
+ * every single poll tick turned out to be a real problem: the callback
+ * reads full signal stats (several more ioctls beyond FE_READ_STATUS),
+ * and on this driver those can *also* block for multiple seconds under
+ * marginal-signal conditions, not just DTV_TUNE/FE_READ_STATUS as
+ * originally assumed — confirmed live via gdb, a scan attempt got stuck
+ * for minutes on one frequency because nearly every 50ms tick triggered
+ * another multi-second blocking stat-read. 250ms is still comfortably
+ * inside libhdhomerun's own wait_for_lock() polling cadence (also
+ * 250ms), so this doesn't reduce how responsive /tunerN/status looks to
+ * a real client. */
+#define PROGRESS_CB_INTERVAL_MS 250
+
 bool dvb_frontend_wait_lock(int fd, int timeout_ms, dvb_frontend_progress_cb cb, void *cb_ctx)
 {
-    int elapsed = 0;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     const int step_ms = 50;
-    while (elapsed < timeout_ms) {
+    int since_cb_ms = PROGRESS_CB_INTERVAL_MS; /* fire on the first iteration */
+
+    for (;;) {
         fe_status_t status = 0;
         if (ioctl(fd, FE_READ_STATUS, &status) == 0) {
-            if (cb) cb(cb_ctx, fd);
+            if (cb && since_cb_ms >= PROGRESS_CB_INTERVAL_MS) {
+                cb(cb_ctx, fd);
+                since_cb_ms = 0;
+            }
             if (status & FE_HAS_LOCK) return true;
         }
+
         usleep(step_ms * 1000);
-        elapsed += step_ms;
+        since_cb_ms += step_ms;
+
+        /* Real wall-clock elapsed time, not a per-iteration counter: an
+         * earlier version just did `elapsed += step_ms` each pass,
+         * which silently assumed every iteration takes ~step_ms. That
+         * held while FE_READ_STATUS itself was the only ioctl in the
+         * loop (normally fast) — once an iteration's *own* work could
+         * legitimately take several real seconds (see above), that
+         * assumption meant the loop could run for many minutes of wall
+         * time while believing only a fraction of timeout_ms had
+         * passed. This still can't bound a single already-in-flight
+         * blocking ioctl (nothing can — see the driver's own
+         * uninterruptible-sleep behavior noted elsewhere), but it does
+         * stop repeatedly re-entering that risk far past the caller's
+         * intended budget. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
+                           (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if (elapsed_ms >= timeout_ms) break;
     }
     return false;
 }
