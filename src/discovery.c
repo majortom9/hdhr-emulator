@@ -140,7 +140,13 @@ static void handle_discover_req(int fd, const struct hdhr_config *cfg,
     hdhr_pkt_start_frame(&out);
     hdhr_pkt_write_tlv_u32(&out, HDHR_TAG_DEVICE_TYPE, HDHR_DEVICE_TYPE_TUNER);
     hdhr_pkt_write_tlv_u32(&out, HDHR_TAG_DEVICE_ID, cfg->device_id);
-    hdhr_pkt_write_tlv_u32(&out, HDHR_TAG_TUNER_COUNT, (uint32_t)cfg->tuner_count);
+    /* TUNER_COUNT is a single byte on the wire, unlike DEVICE_TYPE/
+     * DEVICE_ID (4 bytes) — real clients reject/ignore a 4-byte value
+     * here (len != 1), silently falling back to a tuner count of 1 and
+     * never splitting a multi-tuner device into per-tuner "-0"/"-1"
+     * entries the way hdhomerun_config_gui does for genuine hardware. */
+    uint8_t tuner_count_byte = (uint8_t)cfg->tuner_count;
+    hdhr_pkt_write_tlv(&out, HDHR_TAG_TUNER_COUNT, &tuner_count_byte, 1);
     hdhr_pkt_write_tlv_str(&out, HDHR_TAG_BASE_URL, base_url);
     hdhr_pkt_write_tlv_str(&out, HDHR_TAG_LINEUP_URL, lineup_url);
     size_t out_len = hdhr_pkt_seal_frame(&out, HDHR_TYPE_DISCOVER_RPY);
