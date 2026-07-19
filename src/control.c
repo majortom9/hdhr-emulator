@@ -158,22 +158,24 @@ static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *na
     } else if (strcmp(leaf, "version") == 0) {
         send_value_reply(fd, name, cfg->firmware_version);
     } else if (strcmp(leaf, "features") == 0) {
-        /* Base set matches what we've confirmed shows up correctly in
-         * hdhomerun_config_gui. The "channelmap=us-bcast" tag follows
-         * hdhomerun_device_get_supported()'s prefix-substring-search
-         * convention (see libhdhomerun/hdhomerun_device.c) — real
-         * firmware embeds capability tags like this directly in the
-         * features string rather than a separate GETSET path, but the
-         * EXACT tag name/format here is a best-effort guess, not
-         * confirmed against genuine firmware. If you get a chance, run
-         * `hdhomerun_config <your-real-device-id> get /sys/features`
-         * against one of your actual HDHomeRun units and compare —
-         * same pattern we used to calibrate the signal-strength/SNR
-         * numbers earlier. */
+        /* Confirmed against a genuine HDHomeRun3's actual /sys/features
+         * response (2026-07-19): three newline-separated "name: values"
+         * lines (channelmap, modulation, auto-modulation), each a
+         * space-separated list — not the flat "channel-signal-strength
+         * ..." capability-token string this used to send (an earlier,
+         * unconfirmed guess). hdhomerun_config_gui reads the
+         * "channelmap:" line to populate its Channel selector's
+         * available maps and valid channel-number range; without it in
+         * the expected format, the selector showed blank and its
+         * channel spinner fell back to a meaningless default (observed:
+         * stuck at 255). Scoped to just what we actually support
+         * (8VSB/US-OTA only, per project scope) rather than echoing a
+         * real device's full multi-standard list (us-cable, qam256,
+         * etc.) which we can't actually tune. */
         send_value_reply(fd, name,
-            "channel-signal-strength channel-signal-quality "
-            "channel-symbol-quality channel-network-rate channel-target "
-            "channelmap=us-bcast");
+            "channelmap: us-bcast\n"
+            "modulation: 8vsb\n"
+            "auto-modulation: auto\n");
     } else {
         send_error_reply(fd, name, "ERROR: parameter is read-only or unknown");
     }

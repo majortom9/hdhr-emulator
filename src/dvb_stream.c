@@ -26,6 +26,7 @@
 #define MAX_DEMUX_FDS 6
 #define LOCK_TIMEOUT_MS 2000
 #define FULL_MUX_PID 0x2000 /* DVB API wildcard: "all PIDs" full-TS passthrough */
+#define MIN_WINDOW_SEC 1.0  /* dvb_stream_get_rate()'s minimum sampling window — see its comment */
 
 struct dvb_stream {
     int frontend_fd;
@@ -407,10 +408,20 @@ void dvb_stream_get_rate(const struct dvb_stream *s, double *bits_per_second,
      * divided by the time since that query — reflects current
      * throughput, not a lifetime average that stays distorted by
      * whatever burst happened right after the stream opened (e.g. the
-     * ring buffer's initial fill). Require at least 200ms between
-     * windows so back-to-back status polls don't divide by
-     * near-zero and produce a noisy/inflated instantaneous spike. */
-    if (elapsed >= 0.2) {
+     * ring buffer's initial fill). Require at least MIN_WINDOW_SEC
+     * between windows so back-to-back status polls don't divide by
+     * near-zero and produce a noisy/inflated instantaneous spike.
+     *
+     * 200ms used to be the guard here, but that's short enough to catch
+     * real DVB delivery's natural burstiness (the kernel/USB driver
+     * hands packets to us in chunks, not a smooth trickle) as if it
+     * were the actual rate — confirmed live: a real HDHomeRun-emulated
+     * stream at a true ~6 Mbps (measured independently via a plain curl
+     * pull) reported spikes up to ~45 Mbps in hdhomerun_config_gui,
+     * which polls /tunerN/status very frequently from more than one
+     * persistent connection at once. A full second gives the window
+     * enough real data to average the bursts out. */
+    if (elapsed >= MIN_WINDOW_SEC) {
         uint64_t delta_bytes = bytes_now - window_bytes;
         ns->last_bps = (delta_bytes * 8.0) / elapsed;
         ns->last_pps = (delta_bytes / 188.0) / elapsed;
@@ -419,7 +430,7 @@ void dvb_stream_get_rate(const struct dvb_stream *s, double *bits_per_second,
         ns->window_start_time = now;
     }
     /* else: too soon since the last window closed (e.g. a GUI polling
-     * status faster than 5x/sec) — return the last computed rate rather
+     * status faster than 1x/sec) — return the last computed rate rather
      * than flickering to 0 between windows. */
     *bits_per_second = ns->last_bps;
     *packets_per_second = ns->last_pps;
