@@ -7,6 +7,10 @@
 #include "config.h"
 #include "dvb_stream.h"
 
+/* Sized above ATSC_FREQ_TABLE_COUNT (35, see atsc_freq.h) — see
+ * hdhr_tuner.pending_queue below. */
+#define TUNER_PENDING_QUEUE_CAP 40
+
 /* Mirrors the real device's tunerN GETSET namespace (paths of the form
  * /tunerN/<leaf>). All string fields follow the same conventions as
  * genuine firmware:
@@ -46,6 +50,40 @@ struct hdhr_tuner {
 
     bool     busy;
     struct dvb_stream *active_stream;
+
+    /* FIFO of /tunerN/channel SETs that arrived while a previous one's
+     * scan thread (control.c's channel_scan_thread_main) is still
+     * running on this tuner. Rather than block each request's reply
+     * waiting for the tuner to free up — which could take as long as
+     * the DVB driver's worst-case dead-frequency block (confirmed
+     * multi-second, uninterruptible even by signal on lgdt3306a) and
+     * blow past a client's own reply-wait patience — each is enqueued
+     * here and the in-flight worker drains it itself once done with its
+     * current attempt, instead of releasing the tuner. Sized well above
+     * ATSC_FREQ_TABLE_COUNT (35): a client scan (hdhomerun_config's
+     * `scan`, one SET per RF channel) can queue at most that many
+     * requests behind one in-flight attempt. An earlier version of this
+     * used a single overwritable slot ("only the newest matters") —
+     * that made sense when replies were still slow enough to pace the
+     * client naturally, but once replies became fast (this queue's own
+     * fix), the client fired through the whole band in ~1s per request
+     * and every request but the last got silently clobbered before the
+     * worker ever got to it (confirmed live: 33 of 35 channels in a
+     * manual scan never got attempted at all, including ones with real
+     * signal). A real FIFO instead guarantees every requested frequency
+     * eventually gets a genuine tune+PSIP attempt and the shared channel
+     * database ends up fully populated — the tradeoff is that the
+     * client's own displayed per-line LOCK status can lag well behind
+     * whichever channel the client itself has already moved on to
+     * asking about, since finalize_lock_result() only updates
+     * `status`/`channel` for whichever frequency is still current by
+     * the time an attempt actually finishes. Guarded by `lock`. */
+    struct {
+        uint32_t freq;
+        int      rf_channel;
+    } pending_queue[TUNER_PENDING_QUEUE_CAP];
+    int      pending_head;  /* index of the next entry to dequeue */
+    int      pending_count; /* number of entries currently queued */
 
     /* set by udp_stream.c while a target= push is active, so control.c
      * knows whether to stop a previous push before starting a new one */
