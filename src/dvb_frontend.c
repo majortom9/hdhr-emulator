@@ -226,6 +226,33 @@ static int read_stat_property(int fd, uint32_t cmd, const char *label, double db
     }
 }
 
+static bool read_raw_decibel(int fd, uint32_t cmd, double *out_db)
+{
+    struct dtv_property prop;
+    memset(&prop, 0, sizeof(prop));
+    prop.cmd = cmd;
+    struct dtv_properties props = { .num = 1, .props = &prop };
+
+    if (ioctl(fd, FE_GET_PROPERTY, &props) < 0) return false;
+    if (prop.u.st.len == 0) return false;
+
+    struct dtv_stats *s = &prop.u.st.stat[0];
+    if (s->scale != FE_SCALE_DECIBEL) return false;
+
+    *out_db = s->svalue / 1000.0;
+    return true;
+}
+
+bool dvb_frontend_read_raw_signal_dbm(int fd, double *out_dbm)
+{
+    return read_raw_decibel(fd, DTV_STAT_SIGNAL_STRENGTH, out_dbm);
+}
+
+bool dvb_frontend_read_raw_snr_db(int fd, double *out_db)
+{
+    return read_raw_decibel(fd, DTV_STAT_CNR, out_db);
+}
+
 void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
 {
     memset(out, 0, sizeof(*out));
@@ -246,18 +273,30 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * case has a defined reference rather than being purely
      * driver-dependent.
      *
-     * Real HDHomeRun hardware reports ss=100% at 0 dBmV. Converting via
-     * the standard 75-ohm dBmV<->dBm relationship (0 dBmV = 10*log10(
-     * (0.001V)^2 / 75ohm / 1mW) = -48.75 dBm) gives -48.75 dBm as the
-     * 100% ceiling. The floor (-85 dBm = 0%) is a judgment call based on
+     * Ceiling recalibrated 2026-07-19 against a real HDHomeRun3 (same
+     * antenna feed, tools/calibrate_stats.c's sweep vs. hdhomerun_config
+     * get /tunerN/status on 7 real locked channels): the original
+     * -48.75 dBm ceiling (derived from real firmware's documented
+     * ss=100%-at-0dBmV point, converted via the 75-ohm dBmV<->dBm
+     * relationship) consistently overshot the real device's ss% by
+     * +9 to +17 points on strong signals, while matching it exactly
+     * (63% both) on the one weaker channel sampled — i.e. the curve was
+     * anchored correctly at the bottom but too easy to reach 100% at
+     * the top. -43.0 dBm is the average of each sample's implied
+     * ceiling (100*(dbm-floor)/pct + floor, floor held at -85), and
+     * roughly halves the average error across all 7 points (10.9 -> 3.6
+     * pct-point average |delta|). Only 7 data points, all from one
+     * antenna/splitter setup and none near actual lock-loss, so this
+     * remains an approximation, not an exact match — re-run the sweep
+     * against more/weaker real channels if it drifts again. The floor
+     * (-85 dBm = 0%) is unchanged: still a judgment call based on
      * typical ATSC 8VSB tuner sensitivity specs (usable lock generally
-     * extends to roughly -83 to -90 dBm before the AGC maxes out) —
-     * unlike the ceiling, this isn't derived from a real-device
-     * reference point. Enable debug_signal_stats=1 and compare against
-     * a real HDHomeRun on the same antenna feed to refine it further if
-     * it doesn't track closely enough in practice. */
+     * extends to roughly -83 to -90 dBm before the AGC maxes out), not
+     * verified by this sweep (no marginal-signal samples were
+     * available). Enable debug_signal_stats=1 and compare against a
+     * real HDHomeRun on the same antenna feed to refine either further. */
     out->signal_strength_pct = read_stat_property(fd, DTV_STAT_SIGNAL_STRENGTH,
-                                                   "signal_strength", -85.0, -48.75);
+                                                   "signal_strength", -85.0, -43.0);
     /* Calibrated against a real HDHomeRun with two reference points:
      * snq=100% at 33dB SNR (the ceiling), and snq clustering ~35-40% at
      * 15.2dB SNR. Solving for the floor that satisfies both (using the

@@ -57,6 +57,19 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out);
  * what your specific driver actually returns first). */
 void dvb_frontend_set_debug(bool enabled);
 
+/* Raw (unscaled) DTV_STAT_SIGNAL_STRENGTH / DTV_STAT_CNR readouts in
+ * their native physical units (dBm / dB) — the same values
+ * dvb_frontend_read_stats()'s signal_strength_pct/snr_quality_pct are
+ * derived from via scale_decibel_to_pct(), but before that floor/ceiling
+ * mapping is applied. Returns false if the driver doesn't report the
+ * stat on the FE_SCALE_DECIBEL scale (not supported, or a different
+ * scale entirely) — same condition that makes the corresponding _pct
+ * field -1. For calibrating those floor/ceiling constants against a
+ * real device (see tools/calibrate_stats.c), not needed at daemon
+ * runtime. */
+bool dvb_frontend_read_raw_signal_dbm(int fd, double *out_dbm);
+bool dvb_frontend_read_raw_snr_db(int fd, double *out_db);
+
 /* Fallback for drivers (confirmed: lgdt3306a) that don't populate the
  * modern DVBv5 DTV_STAT_ERROR_BLOCK_COUNT/DTV_STAT_TOTAL_BLOCK_COUNT
  * stats at all — reads the older pre-S2API FE_READ_UNCORRECTED_BLOCKS

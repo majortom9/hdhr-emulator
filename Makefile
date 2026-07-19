@@ -23,8 +23,15 @@ test:
 	$(CC) $(CFLAGS) -o /tmp/hdhr_psip_test src/psip.c test/psip_test.c
 	/tmp/hdhr_psip_test
 
+# RF signal-stat calibration sweep — see tools/calibrate_stats.c.
+# Linked directly against just the frontend/channel-table sources
+# (not via the src/*.c wildcard above) so it doesn't pull in main.c's
+# main() too. Usage: ./calibrate <dvb-adapter-num> [frontend-num]
+calibrate: src/dvb_frontend.c src/dvb_frontend.h src/atsc_freq.c src/atsc_freq.h tools/calibrate_stats.c
+	$(CC) $(CFLAGS) -o calibrate src/dvb_frontend.c src/atsc_freq.c tools/calibrate_stats.c $(LDLIBS)
+
 clean:
-	rm -f $(OBJ) $(BIN)
+	rm -f $(OBJ) $(BIN) calibrate
 
 # Installs the binary + a systemd unit. Run as root on the target Pi.
 install: $(BIN)
