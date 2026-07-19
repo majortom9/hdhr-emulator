@@ -220,13 +220,24 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
             }
             double bps = 0.0, pps = 0.0;
             dvb_stream_get_rate(t->active_stream, &bps, &pps);
+            /* -1 ("no reading available") collapses to 1, not 0 — the
+             * wire protocol's bare-integer ss=/snq=/seq= fields have no
+             * separate "N/A" slot, and dvb_frontend.c's
+             * clamp_pct_floor1() already floors every genuinely
+             * available reading at 1 too, so a literal 0 is never
+             * emitted by this daemon at all. Some clients (e.g.
+             * libhdhomerun's hdhomerun_device_wait_for_lock()) key off
+             * a low reading to mean "confirmed no signal, stop
+             * polling"; 0 is the value most likely to be special-cased
+             * that way by such logic, so avoid it entirely rather than
+             * pick which case gets to keep it. */
             snprintf(val, sizeof(val),
                      "ch=%s lock=%s ss=%d snq=%d seq=%d bps=%.0f pps=%.0f",
                      t->channel,
                      stats.has_lock ? "8vsb" : "none",
-                     stats.signal_strength_pct < 0 ? 0 : stats.signal_strength_pct,
-                     stats.snr_quality_pct < 0 ? 0 : stats.snr_quality_pct,
-                     stats.symbol_quality_pct < 0 ? 0 : stats.symbol_quality_pct,
+                     stats.signal_strength_pct < 0 ? 1 : stats.signal_strength_pct,
+                     stats.snr_quality_pct < 0 ? 1 : stats.snr_quality_pct,
+                     stats.symbol_quality_pct < 0 ? 1 : stats.symbol_quality_pct,
                      bps, pps);
         } else if (t->scan_stats_valid && t->scan_stats_freq == t->tuned_frequency_hz) {
             /* No active stream, but a /tunerN/channel scan has published
@@ -261,9 +272,9 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                      "ch=%s lock=%s ss=%d snq=%d seq=%d",
                      t->channel,
                      lock_word,
-                     stats->signal_strength_pct < 0 ? 0 : stats->signal_strength_pct,
-                     stats->snr_quality_pct < 0 ? 0 : stats->snr_quality_pct,
-                     stats->symbol_quality_pct < 0 ? 0 : stats->symbol_quality_pct);
+                     stats->signal_strength_pct < 0 ? 1 : stats->signal_strength_pct,
+                     stats->snr_quality_pct < 0 ? 1 : stats->snr_quality_pct,
+                     stats->symbol_quality_pct < 0 ? 1 : stats->symbol_quality_pct);
         } else {
             snprintf(val, sizeof(val), "%s", t->status);
         }

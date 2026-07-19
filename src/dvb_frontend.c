@@ -126,19 +126,38 @@ bool dvb_frontend_wait_lock(int fd, int timeout_ms, dvb_frontend_progress_cb cb,
  * inverted against a recent-block window. This mirrors what real
  * HDHomeRun firmware does — a driver-dependent approximation, not a
  * calibrated absolute measurement. */
+/* Clamps to [1,100] rather than [0,100] — -1 is our own sentinel for
+ * "no reading available at all" (see dvb_frontend_read_stats()), and
+ * the wire protocol's ASCII status line has no separate slot for that
+ * sentinel (see control.c), so it gets displayed as a bare 0 same as
+ * every other unavailable stat. If an *available* reading were also
+ * allowed to legitimately read 0, a client couldn't tell "confirmed
+ * nothing here" apart from "no data yet" — and real libhdhomerun
+ * clients act on exactly that distinction (e.g.
+ * hdhomerun_device_wait_for_lock() treats ss<45 as "confirmed no
+ * signal" and stops polling immediately). Reserving 0 exclusively for
+ * "unavailable" and flooring every genuine reading at 1 keeps that
+ * signal meaningful. */
+static int clamp_pct_floor1(int pct)
+{
+    if (pct < 1) pct = 1;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
 static int scale_decibel_to_pct(int64_t millidb, double min_db, double max_db)
 {
     double db = millidb / 1000.0;
     if (db < min_db) db = min_db;
     if (db > max_db) db = max_db;
-    return (int)((db - min_db) / (max_db - min_db) * 100.0 + 0.5);
+    return clamp_pct_floor1((int)((db - min_db) / (max_db - min_db) * 100.0 + 0.5));
 }
 
 static int scale_relative_to_pct(uint64_t uvalue)
 {
     /* FE_SCALE_RELATIVE is defined as 0-65535 across the full range. */
     if (uvalue > 65535) uvalue = 65535;
-    return (int)(uvalue * 100 / 65535);
+    return clamp_pct_floor1((int)(uvalue * 100 / 65535));
 }
 
 /* Set from config (debug_signal_stats=1) via dvb_frontend_set_debug().
@@ -331,9 +350,7 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
     } else {
         double error_ratio = (double)error_blocks / (double)total_blocks;
         int pct = (int)((1.0 - error_ratio) * 100.0 + 0.5);
-        if (pct < 0) pct = 0;
-        if (pct > 100) pct = 100;
-        out->symbol_quality_pct = pct;
+        out->symbol_quality_pct = clamp_pct_floor1(pct);
     }
 }
 
@@ -372,9 +389,7 @@ int dvb_frontend_legacy_seq_pct(int fd, struct dvb_legacy_seq_state *state)
                              (ucblocks - state->last_ucblocks) : 0;
     double expected_blocks = ATSC_SEGMENTS_PER_SEC * elapsed;
     double error_ratio = expected_blocks > 0 ? (delta_blocks / expected_blocks) : 0.0;
-    int pct = (int)((1.0 - error_ratio) * 100.0 + 0.5);
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
+    int pct = clamp_pct_floor1((int)((1.0 - error_ratio) * 100.0 + 0.5));
 
     state->last_ucblocks = ucblocks;
     state->last_time = now;
