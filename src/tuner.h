@@ -39,6 +39,18 @@ struct hdhr_tuner {
     char     target[64];
     uint32_t lockkey;
 
+    /* /tunerN/filter's explicit PID override, in wire format (see
+     * pid_filter.h) — "" (empty) means "not set", i.e. PID selection
+     * falls back to program's normal resolution. Confirmed against a
+     * genuine HDHomeRun3 (2026-07-19): setting /tunerN/program
+     * recomputes filter to that program's own PID set, so it's cleared
+     * (not merely left stale) whenever program or channel/vchannel
+     * changes — see handle_tuner_set. Snapshotted into udp_stream.c's
+     * push_ctx at push-start time, same as program; only ever consulted
+     * by the target= push path, not HTTP passthrough (same established
+     * asymmetry as program itself). */
+    char     filter_override[256];
+
     int      vch_major;
     int      vch_minor;
     bool     vch_resolved;

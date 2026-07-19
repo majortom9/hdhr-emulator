@@ -20,10 +20,23 @@ struct dvb_stream;
  * thread capturing the resulting TS into an internal ring buffer.
  * Returns NULL on failure (no lock, ioctl error, etc — check stderr for
  * which). `frontend`/`demux_num` are almost always 0 on consumer USB
- * tuners; see config.h. */
+ * tuners; see config.h.
+ *
+ * pid_filter: NULL or "" to use program_override's normal resolution
+ * (the common case); otherwise an explicit /tunerN/filter wire-format
+ * PID list (see pid_filter.h) that takes over PID selection entirely,
+ * ignoring program_override — matching real firmware, where an
+ * explicit filter is a lower-level override that supersedes
+ * program-based selection. PAT (0x0000) is still always added on top
+ * so a player can actually identify the stream, same as the
+ * program_override path already does. A filter whose total PID count
+ * is too wide to enumerate as individual demux PES filters (e.g. the
+ * real device's own "0x0000-0x1fff" default, or anything else spanning
+ * more than MAX_DEMUX_FDS-1 PIDs) falls back to full-mux passthrough
+ * instead of failing outright. */
 struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
                                     const struct dvb_channel *channel,
-                                    int program_override);
+                                    int program_override, const char *pid_filter);
 
 /* Blocking read, same contract tvh_stream_read() had: 0 = EOF/closing,
  * -1 = error, otherwise bytes read. */

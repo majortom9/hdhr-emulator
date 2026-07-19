@@ -188,8 +188,11 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
         }
     }
 
+    /* HTTP passthrough doesn't consult t->program or t->filter_override,
+     * same established asymmetry as program (see tuner.h) — this path
+     * always streams the plain named channel. */
     struct dvb_stream *ds = dvb_stream_open(t->adapter, cfg->dvb_frontend, cfg->dvb_demux,
-                                             ch, DVB_PROGRAM_DEFAULT);
+                                             ch, DVB_PROGRAM_DEFAULT, NULL);
     if (!ds) {
         send_headers(fd, "502 Bad Gateway", "text/plain", 0);
         tuner_release(t);

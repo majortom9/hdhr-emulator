@@ -29,6 +29,7 @@ struct push_ctx {
     struct hdhr_tuner *tuner;
     struct dvb_channel channel; /* snapshot at push-start time */
     int  program_override;
+    char pid_filter[256]; /* snapshot of t->filter_override at push-start time; see tuner.h */
     char dest_ip[64];
     int  dest_port;
 };
@@ -62,7 +63,7 @@ static void *push_thread_main(void *arg)
     }
 
     struct dvb_stream *ds = dvb_stream_open(t->adapter, ctx->cfg.dvb_frontend, ctx->cfg.dvb_demux,
-                                             &ctx->channel, ctx->program_override);
+                                             &ctx->channel, ctx->program_override, ctx->pid_filter);
     if (!ds) {
         fprintf(stderr, "udp_stream: tuner%d: failed to open DVB stream for %d.%d\n",
                 t->index, ctx->channel.major, ctx->channel.minor);
@@ -166,6 +167,7 @@ int udp_push_start(const struct hdhr_config *cfg, struct hdhr_tuner *t,
     ctx->tuner = t;
     ctx->channel = *ch;
     ctx->program_override = t->program;
+    snprintf(ctx->pid_filter, sizeof(ctx->pid_filter), "%s", t->filter_override);
     snprintf(ctx->dest_ip, sizeof(ctx->dest_ip), "%s", dest_ip);
     ctx->dest_port = dest_port;
 

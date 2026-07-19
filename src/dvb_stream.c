@@ -9,6 +9,7 @@
 #include "dvb_stream.h"
 #include "dvb_frontend.h"
 #include "dvb_channel.h"
+#include "pid_filter.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -172,7 +173,7 @@ static void *reader_thread_main(void *arg)
 
 struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
                                     const struct dvb_channel *channel,
-                                    int program_override)
+                                    int program_override, const char *pid_filter)
 {
     struct dvb_stream *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -197,9 +198,35 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
     }
 
     bool ok = true;
-    if (program_override == 0) {
-        fprintf(stderr, "dvb_stream: %d.%d: full-mux passthrough (program=0)\n",
-                channel->major, channel->minor);
+    struct pid_filter pf;
+    bool have_filter = pid_filter && pid_filter[0] &&
+                        pid_filter_parse(pid_filter, &pf) && pf.count > 0;
+
+    if (have_filter && pid_filter_total_count(&pf) <= MAX_DEMUX_FDS - 1) {
+        /* Explicit filter, small enough to enumerate as individual
+         * demux PES filters (reserving one slot for PAT below) —
+         * takes over PID selection entirely, ignoring program_override,
+         * same as real firmware treats an explicit /tunerN/filter as a
+         * lower-level override. */
+        fprintf(stderr, "dvb_stream: %d.%d: explicit PID filter (%d PIDs)\n",
+                channel->major, channel->minor, pid_filter_total_count(&pf));
+        ok = add_pid_if_new(s, adapter, demux_num, 0x0000); /* PAT, same as the program path below */
+        for (int i = 0; i < pf.count && ok; i++) {
+            for (uint32_t pid = pf.ranges[i].start; pid <= pf.ranges[i].end && ok; pid++) {
+                ok = add_pid_if_new(s, adapter, demux_num, (uint16_t)pid);
+            }
+        }
+    } else if (have_filter || program_override == 0) {
+        /* Either program=0's full-mux passthrough, or an explicit
+         * filter too wide to enumerate one PID at a time (e.g. the
+         * real device's own "0x0000-0x1fff" default) — a hardware
+         * demux only has a handful of concurrent PID filter slots
+         * (MAX_DEMUX_FDS), nowhere near enough for a range like that
+         * one PID per filter, so fall back to the wildcard filter
+         * instead of failing outright. */
+        fprintf(stderr, "dvb_stream: %d.%d: full-mux passthrough (%s)\n",
+                channel->major, channel->minor,
+                have_filter ? "filter too wide to enumerate" : "program=0");
         ok = add_pid_if_new(s, adapter, demux_num, FULL_MUX_PID);
     } else {
         const struct dvb_channel *target = channel;

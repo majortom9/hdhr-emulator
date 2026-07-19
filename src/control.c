@@ -67,6 +67,7 @@
 #include "dvb_scan.h"
 #include "atsc_freq.h"
 #include "udp_stream.h"
+#include "pid_filter.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -231,6 +232,51 @@ static void handle_sys_set(int fd, const struct hdhr_config *cfg, const char *na
     send_error_reply(fd, name, "ERROR: parameter is read-only or unknown");
 }
 
+/* Computes what /tunerN/filter should report when no explicit
+ * filter_override is set — mirrors what dvb_stream_open() would
+ * actually select for the tuner's current channel+program state.
+ * Confirmed against a genuine HDHomeRun3 (2026-07-19): PAT is excluded
+ * from the displayed string even though it's always streamed
+ * regardless (see dvb_stream.c's own PAT handling), and the full
+ * "0x0000-0x1fff" range is shown whenever program==0 (full mux) or
+ * nothing is usefully resolved yet — matches what a freshly-tuned real
+ * device reported before any program had been explicitly selected. */
+static void compute_auto_filter(struct hdhr_tuner *t, char *out, size_t out_len)
+{
+    if (t->program == 0 || t->tuned_frequency_hz == 0) {
+        snprintf(out, out_len, "0x0000-0x1fff");
+        return;
+    }
+
+    const struct dvb_channel *siblings[DVB_CHANNEL_MAX];
+    int n = dvb_channels_on_freq(t->tuned_frequency_hz, siblings, DVB_CHANNEL_MAX);
+    const struct dvb_channel *target = NULL;
+    for (int i = 0; i < n; i++) {
+        if (siblings[i]->program_number == (uint16_t)t->program) {
+            target = siblings[i];
+            break;
+        }
+    }
+    if (!target && t->vch_resolved) target = dvb_find_channel(t->vch_major, t->vch_minor);
+    if (!target) {
+        snprintf(out, out_len, "0x0000-0x1fff");
+        return;
+    }
+
+    uint16_t pids[4];
+    int count = 0;
+    if (target->pmt_pid) pids[count++] = target->pmt_pid;
+    if (target->pcr_pid) pids[count++] = target->pcr_pid;
+    if (target->video_pid) pids[count++] = target->video_pid;
+    if (target->audio_pid) pids[count++] = target->audio_pid;
+
+    if (count == 0) {
+        snprintf(out, out_len, "none");
+        return;
+    }
+    pid_filter_format(pids, count, out, out_len);
+}
+
 static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, const char *leaf)
 {
     char val[512];
@@ -250,6 +296,12 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
         }
     } else if (strcmp(leaf, "program") == 0) {
         snprintf(val, sizeof(val), "%d", t->program);
+    } else if (strcmp(leaf, "filter") == 0) {
+        if (t->filter_override[0]) {
+            snprintf(val, sizeof(val), "%s", t->filter_override);
+        } else {
+            compute_auto_filter(t, val, sizeof(val));
+        }
     } else if (strcmp(leaf, "target") == 0) {
         snprintf(val, sizeof(val), "%s", t->target);
     } else if (strcmp(leaf, "lockkey") == 0) {
@@ -631,6 +683,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         tuner_bind_channel(t, ch, DVB_PROGRAM_DEFAULT);
         tuner_lock(t);
         snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
+        t->filter_override[0] = '\0'; /* new mux — any prior filter's PIDs no longer apply */
         tuner_unlock(t);
 
         char val[32];
@@ -646,6 +699,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             snprintf(t->channel, sizeof(t->channel), "none");
             t->tuned_frequency_hz = 0;
             t->vch_resolved = false;
+            t->filter_override[0] = '\0';
             snprintf(t->status, sizeof(t->status), "state=idle");
             tuner_unlock(t);
             send_value_reply(fd, name, "none");
@@ -720,6 +774,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                     t->pending_count++;
                     t->tuned_frequency_hz = freq;
                     t->vch_resolved = false;
+                    t->filter_override[0] = '\0';
                     snprintf(t->channel, sizeof(t->channel), "8vsb:%u", freq);
                     snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
                     tuner_unlock(t);
@@ -742,6 +797,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         tuner_lock(t);
         t->tuned_frequency_hz = freq;
         t->vch_resolved = false; /* raw tune doesn't select a specific virtual channel yet */
+        t->filter_override[0] = '\0'; /* new mux — any prior filter's PIDs no longer apply */
         /* "8vsb:<freq_hz>" — confirmed against a genuine HDHomeRun3's
          * actual "Physical Channel" display in hdhomerun_config_gui
          * (2026-07-18): it reports modulation:frequency, not
@@ -805,6 +861,35 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         int prog = atoi(value);
         tuner_lock(t);
         t->program = prog;
+        /* Real firmware recomputes /tunerN/filter to the new program's
+         * own PIDs when program is set (confirmed live, 2026-07-19) --
+         * clearing filter_override lets compute_auto_filter() do that
+         * on the next GET, and lets the next stream open pick up the
+         * new program's PIDs instead of a stale explicit filter tied
+         * to whatever program was previously selected. */
+        t->filter_override[0] = '\0';
+        tuner_unlock(t);
+        send_value_reply(fd, name, value);
+        return;
+    }
+
+    if (strcmp(leaf, "filter") == 0) {
+        if (strcmp(value, "none") == 0 || value[0] == '\0') {
+            tuner_lock(t);
+            t->filter_override[0] = '\0';
+            tuner_unlock(t);
+            send_value_reply(fd, name, "none");
+            return;
+        }
+
+        struct pid_filter pf;
+        if (!pid_filter_parse(value, &pf)) {
+            send_error_reply(fd, name, "ERROR: expected \"none\" or \"0x<nnnn>[-0x<nnnn>] ...\"");
+            return;
+        }
+
+        tuner_lock(t);
+        snprintf(t->filter_override, sizeof(t->filter_override), "%s", value);
         tuner_unlock(t);
         send_value_reply(fd, name, value);
         return;
@@ -875,6 +960,7 @@ static void dispatch_getset(struct conn_ctx *cctx, const char *name, int have_va
             "/tuner<n>/channel <modulation>:<freq|ch>\n"
             "/tuner<n>/channelmap <channelmap>\n"
             "/tuner<n>/debug\n"
+            "/tuner<n>/filter \"0x<nnnn>-0x<nnnn> [...]\"\n"
             "/tuner<n>/lockkey\n"
             "/tuner<n>/program <program number>\n"
             "/tuner<n>/status\n"
