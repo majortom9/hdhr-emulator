@@ -284,6 +284,18 @@ timer-driven loop), so this one fix made all three GUI channel-changing
 controls (manual scan, the number spinner, the scan arrows) work
 correctly at once.
 
+`"us-bcast:<N>"` is accepted here too (`parse_channel_to_freq()`,
+resolved the same way via `atsc_channel_to_freq()`), but that's this
+project's own convenience addition, not something real firmware
+actually accepts on `/tunerN/channel` — confirmed live against a
+genuine HDHomeRun3: `set /tuner0/channel us-bcast:7` returns `"ERROR:
+invalid channel"`, while `set /tuner0/channel auto:177000000` works.
+`hdhomerun_channelscan.c` only ever sends `"auto:<freq_hz>"` (it
+resolves a channel number to a frequency itself, client-side, from its
+own channel-map table, before sending anything). Worth knowing if
+you're driving a real device the same way you'd drive this emulator —
+`us-bcast:N` won't work there.
+
 ## 7. Channel scanning & PSIP pipeline
 
 `dvb_scan.c` provides two composable primitives rather than one monolithic
@@ -318,10 +330,13 @@ by both HTTP pulls and UDP `target=` pushes:
 
 1. `dvb_stream_open()` tunes the frontend (independently of whatever
    `/tunerN/channel` last did — a stream open is a fresh tune), sets up
-   demux PID filters (either specific program/PCR/video/audio PIDs, or the
-   `0x2000` full-mux wildcard PID for `program=0`), and spawns a reader
-   thread that pulls from `/dev/dvb/adapterN/dvrM` into an internal ring
-   buffer.
+   demux PID filters, and spawns a reader thread that pulls from
+   `/dev/dvb/adapterN/dvrM` into an internal ring buffer. Which PIDs get
+   filtered follows a precedence: an explicit `pid_filter` argument (from
+   `/tunerN/filter` — see §11) wins outright if it's small enough to
+   enumerate as individual demux filters; otherwise `program_override`
+   picks specific program/PCR/video/audio PIDs, or the `0x2000` full-mux
+   wildcard PID for `program=0` or a `pid_filter` too wide to enumerate.
 2. Consumers (`http_server.c`'s `stream_channel_to_client`,
    `udp_stream.c`'s `push_thread_main`) call `dvb_stream_read()` in a loop
    and forward bytes onward — to a `write()` on the HTTP socket, or
@@ -336,7 +351,187 @@ by both HTTP pulls and UDP `target=` pushes:
    the tuner claim and closing the stream are the same operation from a
    caller's perspective.
 
-## 9. Debugging techniques that worked, worth reusing
+## 9. Reclaiming an abandoned `target=` push
+
+UDP has no inherent "connection dropped" signal the way TCP does. A
+`target=` push (`udp_stream.c`) keeps a tuner claimed and streaming to
+whatever `ip:port` a client last set, and nothing about a `sendto()`
+failing tells you the *client* is actually still there to receive it —
+a client that crashes, gets `kill -9`'d, or just drops off the network
+without sending `target=none` first leaves that tuner locked to a dead
+destination forever. Reproduced live: `kill -9`'ing an in-progress
+`hdhomerun_config save` left `/tunerN/target` reporting the dead
+destination indefinitely, with no way to notice from the server side
+alone.
+
+Real `libhdhomerun` clients already send the fix for this, they just
+weren't being listened to: `hdhomerun_video_thread_send_keepalive()`
+(`hdhomerun_video.c`) sends a small UDP packet (the tuner's lockkey) to
+the device's UDP port 5004 roughly once a second for as long as
+`hdhomerun_device_stream_start()`/`stream_recv()` are being used.
+`keepalive.c` binds that port and, for each packet, matches its
+*source* address against `t->keepalive_match_addr`/`keepalive_match_port`
+(binary form of the current push's destination, set by
+`udp_push_start()`) — a match means "this tuner's client is still alive,"
+since the client's own outbound keepalives share the same local socket
+(and therefore the same `ip:port`) it registered via `target=`.
+
+One thread does double duty: it binds the socket with a `SO_RCVTIMEO` of
+`SWEEP_INTERVAL_MS` (2s), so every `recvfrom()` either gets a real
+keepalive packet or simply times out — either way, it then sweeps every
+tuner and reclaims (`udp_push_stop()`, the same path an explicit
+`target=none` uses) any whose `last_keepalive_time` is more than
+`KEEPALIVE_TIMEOUT_MS` (15s — no reference for real firmware's own
+value, chosen as ~10x+ the client's ~1s cadence) stale. This piggybacks
+the staleness check on the socket's own timeout rather than running a
+separate timer thread, so a total silence (no keepalive traffic at all,
+e.g. a raw non-`libhdhomerun` client that never implements this) still
+gets swept on the same cadence as a real packet arriving would.
+
+One subtlety that showed up in testing: `udp_push_stop()` blocks up to
+~2s polling for the push thread to actually notice `stop_requested` and
+exit — which can occasionally run longer than one sweep tick if
+`dvb_stream_read()` is itself blocked waiting on the capture thread.
+The sweep checks `t->udp_push_stop_requested` before re-triggering a
+reclaim already in flight, otherwise a single stale push logged (and
+re-polled) the same reclaim two or three times before it actually
+finished stopping.
+
+`udp_stream.c`'s `push_thread_main()` also gained a related fix while
+this was being built: it now resets `t->target` to `"none"` on *every*
+exit path (upstream EOF, a `sendto()` error, or this new reclaim), not
+just an explicit `target=none` SET — before, `/tunerN/target` could keep
+reporting a destination that had, in fact, already stopped receiving
+anything.
+
+## 10. `/tunerN/filter` — a lower-level override than `program`
+
+Confirmed against a genuine HDHomeRun3 (same antenna feed, real device):
+`filter` defaults to `"0x0000-0x1fff"` (the full 13-bit PID space,
+i.e. unfiltered) whenever nothing more specific has been selected, and
+setting `/tunerN/program` **automatically recomputes it** to that
+program's actual PMT/PCR/video/audio PIDs — e.g. `"0x0030-0x0031 0x0034"`
+for a channel whose PMT and PCR/video share adjacent PIDs. Interestingly,
+the real device's recomputed string excludes PAT (`0x0000`) even though
+PAT is still streamed regardless — the displayed filter reflects the
+*program-specific* PIDs added on top of an implicit PAT, not the
+literal complete PID set actually demuxed. `filter` is also
+independently settable, and doing so takes over PID selection entirely,
+overriding whatever `program` would have picked.
+
+This project's implementation (`pid_filter.c`/`.h` for the wire format,
+`dvb_stream_open()`'s new `pid_filter` parameter for applying it, `tuner.h`'s
+`filter_override` string for tracking an explicit one) follows the same
+shape:
+
+- **GET** returns `filter_override` verbatim if a client has explicitly
+  set one; otherwise `control.c`'s `compute_auto_filter()` derives it
+  fresh from the tuner's current channel+program state, on every read —
+  same PMT/PCR/video/audio resolution `dvb_stream_open()` itself would
+  use, formatted (and range-merged) by `pid_filter_format()`, PAT
+  excluded to match the real device's own display convention.
+- **SET** parses via `pid_filter_parse()`; `"none"`/empty clears the
+  override back to auto-derived. Real usage streams directly off
+  `channel`+`program`+`filter` without ever touching `vchannel` — the
+  same raw, PSIP-independent workflow §12 covers for `channel`+`program`+
+  `target=`.
+- **Precedence and clearing**: `filter_override` is cleared whenever
+  `channel`, `vchannel`, or `program` changes — matching the real
+  device's own auto-recompute-on-`program`-change behavior, and
+  preventing a filter tied to a now-irrelevant mux/program from silently
+  persisting onto whatever gets selected next.
+- **Applying it** (`dvb_stream_open()`): an explicit filter small enough
+  to fit as individual demux PES filters (`MAX_DEMUX_FDS - 1` PIDs,
+  reserving one slot for PAT) gets enumerated one PID at a time, same
+  mechanism `add_pid_if_new()` already used for program-based selection.
+  A filter too wide to enumerate — including the real device's own
+  `"0x0000-0x1fff"` default — falls back to the existing `0x2000`
+  full-mux wildcard instead of failing outright: a hardware demux has
+  nowhere near enough concurrent PID-filter slots to open one per PID
+  across a range that size.
+
+Same established scope as `program` (§4 predates this, but the
+asymmetry is pre-existing, not new here): only the `target=` push path
+consults `filter`/`program` at all. `http_server.c`'s HTTP passthrough
+always streams the plain named channel's own default PIDs, ignoring
+both.
+
+## 11. `/sys/restart` and `/sys/copyright` — deliberate departures from real firmware
+
+Two `/sys/` leaves exist specifically because *matching* real firmware
+exactly would be the wrong choice here:
+
+- **`/sys/restart <resource>`** is real (confirmed via a genuine
+  HDHomeRun3's own `get help`), but the wire protocol has no real
+  authentication — `lockkey` is an advisory courtesy value real clients
+  set, not a security boundary — so implementing it unconditionally
+  would let *any* client on the LAN stop the daemon. `allow_remote_restart`
+  in the config (default `false`) makes it an explicit, deliberate
+  admin opt-in instead. Real firmware's exact `<resource>` semantics
+  aren't recoverable from the client library (it's a raw passthrough
+  SET with no documented values) and don't matter here anyway — this
+  daemon is one process regardless of what resource is named, so any
+  accepted value triggers a full `exit(0)`. No in-place re-exec; a
+  supervisor (systemd's `Restart=always`) is what's expected to bring it
+  back, matching how `systemd/hdhr-emulator.service` is already set up.
+  The reply is sent to the client *before* exiting — already handed to
+  the kernel's socket buffer by the time `send_value_reply()` returns,
+  so it survives the `exit()` — so a well-behaved client sees a clean
+  acknowledgment rather than a communication error.
+- **`/sys/copyright`** deliberately does **not** echo real firmware's
+  actual value, a literal Silicondust copyright notice. Doing so would
+  misattribute this project's own independently-written, clean-room
+  code (see README.md's opening paragraphs) to Silicondust — a
+  different kind of claim than the wire-protocol mimicry the rest of
+  this daemon does, where matching real behavior *is* the entire point.
+  The value here is this project's own short statement instead: name,
+  repo link, and an explicit "not Silicondust software" disclaimer.
+
+## 12. `target=` doesn't require `vchannel` — and neither should `filter`/`program`
+
+`udp_push_start()` (`udp_stream.c`) originally required `t->vch_resolved`
+— only ever set by `/tunerN/vchannel` — before it would start a push,
+which meant the classic raw-protocol workflow (`set /tunerN/channel
+auto:<freq>`, `set /tunerN/program <N or 0>`, `set /tunerN/target
+udp://...`, never touching `vchannel` at all) failed outright with
+`"ERROR: unable to start stream (no channel set?)"`, even though
+`program=0`'s full-mux passthrough needs nothing more than a tuned
+frequency to mean something.
+
+Fixed by falling back to `dvb_channels_on_freq(t->tuned_frequency_hz, ...)`
+when no named virtual channel is resolved: any channel already known on
+that mux works as `dvb_stream_open()`'s base struct, since it only
+supplies the PAT/PMT/PID lookup starting point — `dvb_stream_open()`
+itself already resolves `program_override`/`pid_filter` against the
+mux's siblings independently of which sibling was passed in. Real usage
+commonly drives `target=` this way — a manual RF tune plus an explicit
+program number or PID filter, with no PSIP name resolution involved at
+all — so requiring `vchannel` first was a gap relative to real behavior,
+not a deliberate restriction.
+
+## 13. Never report a literal `0` for `ss=`/`snq=`/`seq=`
+
+Two different situations could both produce a bare `0` in the wire
+protocol's `ss=`/`snq=`/`seq=` fields, with no way for a client to tell
+them apart: a genuinely weak-but-present reading clamped at the
+calibration floor, and this daemon's own `-1` ("no reading available at
+all") sentinel getting collapsed into `0` for display, since the
+ASCII status line has no separate N/A slot. That distinction is more
+than cosmetic — `libhdhomerun`'s own `hdhomerun_device_wait_for_lock()`
+treats a low `ss` as "confirmed no signal, stop polling immediately"
+(the exact behavior §5 is built around not tripping prematurely), so a
+client genuinely cannot distinguish "nothing here" from "no data yet"
+once both read `0`.
+
+`dvb_frontend.c`'s `clamp_pct_floor1()` floors every *genuinely
+available* reading at `1` instead of `0` (used by `scale_decibel_to_pct()`,
+`scale_relative_to_pct()`, and both post-FEC error-ratio calculations);
+`control.c`'s two status-line formatters collapse the `-1` sentinel to
+`1` as well, for the same reason — rather than pick which of the two
+cases gets to keep `0`, this daemon just never emits it in these fields
+at all.
+
+## 14. Debugging techniques that worked, worth reusing
 
 - **`/proc/<pid>/task/*/stat` sampling** (`ps -eLo tid,stat,wchan,comm`,
   ~100ms interval, piped to a log file, run *concurrently* with a failing

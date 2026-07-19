@@ -8,7 +8,36 @@
  * dvb_stream.c for the RF tuning and PSIP channel mapping this used to
  * delegate):
  *
- *   /sys/model, /sys/features, /sys/version        (read-only)
+ *   help               GET-only, bare item (no /sys/ or /tunerN/ prefix) —
+ *                      lists every path below, same style as a genuine
+ *                      HDHomeRun3's own `get help` reply.
+ *   /sys/model         firmware codename (e.g. "hdhomerun3_atsc") — NOT
+ *                      the marketing model number, that's /sys/hwmodel
+ *                      (confirmed against a genuine HDHomeRun3; an
+ *                      earlier version of this had the two swapped).
+ *   /sys/hwmodel, /sys/features, /sys/version       (read-only)
+ *   /sys/copyright     read-only; our own wording, not real firmware's
+ *                      actual value (a literal Silicondust notice) — see
+ *                      its own comment in handle_sys_get for why.
+ *   /sys/8vsb_override accepted/echoed but inert — this project always
+ *                      requests VSB_8 regardless (US-OTA 8VSB only, per
+ *                      scope), so there's nothing to override.
+ *   /sys/debug, /tunerN/debug   diagnostic dumps. Real firmware's own
+ *                      values are hardware-specific counters (memory
+ *                      pools, PLL calibration, DMA/queue stats) this
+ *                      daemon doesn't have; these report genuine
+ *                      process/tuner state instead of fabricating
+ *                      plausible-looking fake ones.
+ *   /sys/restart       SET-only, "<resource>" argument (value accepted
+ *                      but not distinguished — this daemon is one
+ *                      process either way). Rejected unless
+ *                      allow_remote_restart=1 in the config (default
+ *                      off): the wire protocol has no real
+ *                      authentication, so this is an explicit opt-in,
+ *                      not something any LAN client gets by default. No
+ *                      in-place re-exec — exits the process; a
+ *                      supervisor (systemd Restart=always) is what's
+ *                      expected to bring it back.
  *   /tunerN/channel    raw RF tune: "auto:<freq_hz>" | "8vsb:<freq_hz>" |
  *                      "us-bcast:<N>" | "none". Claims the tuner and
  *                      tunes + performs live PSIP detection
@@ -40,8 +69,31 @@
  *   /tunerN/program    MPEG program number filter — 0 for full-mux
  *                      passthrough, or a specific program_number to pick
  *                      a different subchannel sharing the selected
- *                      channel's mux (see dvb_stream.h)
- *   /tunerN/target     "none" | "udp://ip:port" — drives udp_stream.c
+ *                      channel's mux (see dvb_stream.h). Recomputes
+ *                      /tunerN/filter to that program's own PIDs
+ *                      (confirmed against a genuine HDHomeRun3), which
+ *                      means it also clears any explicit filter
+ *                      override that was in place.
+ *   /tunerN/filter     explicit PID whitelist, "0x<nnnn>[-0x<nnnn>] ..."
+ *                      (see pid_filter.h) — a lower-level override that
+ *                      takes over PID selection from program entirely
+ *                      when set. GET reflects either that explicit
+ *                      override, or (the common case) the PID set
+ *                      program/channel would actually stream, computed
+ *                      fresh each read. Cleared whenever channel,
+ *                      vchannel, or program changes. Only the target=
+ *                      push path (udp_stream.c) consults it — same
+ *                      established scope as program itself; HTTP
+ *                      passthrough always streams the plain named
+ *                      channel regardless of either.
+ *   /tunerN/target     "none" | "udp://ip:port" — drives udp_stream.c.
+ *                      A push abandoned by an uncleanly-terminated
+ *                      client (crashed, killed, network dropped — never
+ *                      sent target=none) is automatically reclaimed by
+ *                      keepalive.c once its client stops sending the
+ *                      keepalive packets real libhdhomerun clients send
+ *                      to UDP port 5004 roughly once a second while
+ *                      streaming.
  *   /tunerN/lockkey    stored/reported; NOT enforced against concurrent
  *                      writers yet (fine for a single-household LAN tool,
  *                      called out here so it isn't assumed otherwise)
