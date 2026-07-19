@@ -59,3 +59,13 @@ scan_on_startup=1
 # decibel-scale signal strength is in (dBmV, dBm, etc vary by driver) —
 # see dvb_frontend.c for the full explanation.
 #debug_signal_stats=1
+
+# Off by default: whether a network client can make this daemon exit
+# via /sys/restart (real HDHomeRun protocol leaf; see get help). The
+# wire protocol has no real authentication (lockkey is an advisory
+# courtesy value, not a security boundary), so any client on the LAN
+# could otherwise stop the daemon. There's no in-place restart — the
+# process just exits, and needs a supervisor (systemd's Restart=always;
+# see systemd/hdhr-emulator.service) to bring it back. Only turn this on
+# if you're actually running under one and want that recovery path.
+#allow_remote_restart=1

@@ -31,6 +31,7 @@ void config_defaults(struct hdhr_config *cfg)
     cfg->dvb_demux = 0;
     cfg->scan_on_startup = true;
     cfg->debug_signal_stats = false;
+    cfg->allow_remote_restart = false;
 }
 
 static void trim(char *s)
@@ -93,6 +94,8 @@ int config_load(const char *path, struct hdhr_config *cfg)
             cfg->scan_on_startup = (atoi(val) != 0);
         } else if (strcmp(key, "debug_signal_stats") == 0) {
             cfg->debug_signal_stats = (atoi(val) != 0);
+        } else if (strcmp(key, "allow_remote_restart") == 0) {
+            cfg->allow_remote_restart = (atoi(val) != 0);
         } else if (strncmp(key, "tuner", 5) == 0 && strstr(key, "_adapter") != NULL) {
             /* tunerN_adapter=X — override which /dev/dvb/adapterX a given
              * hdhr_tuner slot maps to, for boxes where tuners aren't

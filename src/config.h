@@ -25,6 +25,7 @@ struct hdhr_config {
     int      dvb_demux;             /* demux number within each adapter, default 0    */
     bool     scan_on_startup;       /* default true */
     bool     debug_signal_stats;    /* default false — see dvb_frontend.h */
+    bool     allow_remote_restart;  /* default false — see control.c's /sys/restart handler */
 };
 
 void config_defaults(struct hdhr_config *cfg);

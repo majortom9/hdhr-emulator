@@ -223,11 +223,38 @@ static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *na
 static void handle_sys_set(int fd, const struct hdhr_config *cfg, const char *name,
                             const char *leaf, const char *value)
 {
-    (void)cfg;
     if (strcmp(leaf, "8vsb_override") == 0) {
         snprintf(g_8vsb_override, sizeof(g_8vsb_override), "%s", value);
         send_value_reply(fd, name, g_8vsb_override);
         return;
+    }
+    if (strcmp(leaf, "restart") == 0) {
+        /* Off by default — this is a network peer asking the daemon to
+         * exit, and the wire protocol has no real authentication
+         * (lockkey is an advisory courtesy value real clients set, not
+         * a security boundary). allow_remote_restart in the config
+         * file is an explicit, deliberate opt-in for admins who want
+         * it (e.g. to recover a wedged tuner from a script) rather than
+         * something any client on the LAN gets by default. */
+        if (!cfg->allow_remote_restart) {
+            send_error_reply(fd, name, "ERROR: remote restart disabled "
+                                        "(see allow_remote_restart in config)");
+            return;
+        }
+        /* Real firmware's <resource> argument presumably lets it
+         * restart a narrower subsystem than the whole box, but nothing
+         * in the client library gives concrete values to target, and
+         * this daemon is one process either way — any accepted value
+         * triggers a full exit. No in-place re-exec: a process
+         * supervisor (systemd's Restart=always, etc — see
+         * systemd/hdhr-emulator.service) is what's expected to bring it
+         * back up. Reply before exiting so the client sees a clean
+         * acknowledgment rather than a communication error; the reply
+         * is already handed to the kernel's socket buffer by the time
+         * send_value_reply() returns, so it survives the exit(). */
+        fprintf(stderr, "control: /sys/restart requested (resource=\"%s\") -- exiting\n", value);
+        send_value_reply(fd, name, value);
+        exit(0);
     }
     send_error_reply(fd, name, "ERROR: parameter is read-only or unknown");
 }
@@ -956,6 +983,7 @@ static void dispatch_getset(struct conn_ctx *cctx, const char *name, int have_va
             "/sys/features\n"
             "/sys/hwmodel\n"
             "/sys/model\n"
+            "/sys/restart <resource>\n"
             "/sys/version\n"
             "/tuner<n>/channel <modulation>:<freq|ch>\n"
             "/tuner<n>/channelmap <channelmap>\n"
