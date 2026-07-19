@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <time.h>
 
 #define TS_PACKET_SIZE   188
 #define TS_PER_DATAGRAM  7
@@ -103,6 +104,16 @@ static void *push_thread_main(void *arg)
     fprintf(stderr, "udp_stream: tuner%d: push stopped (%llu TS packets, %llu bytes sent)\n",
             t->index, (unsigned long long)packets_sent, (unsigned long long)bytes_sent);
 
+    /* Reset target back to "none" here rather than only on an explicit
+     * target=none SET — this loop can also exit on its own (upstream
+     * EOF/error, sendto failure, or keepalive.c reclaiming an
+     * abandoned push), and t->target is what /tunerN/target GET
+     * reports; leaving it at a stale "udp://..."/"rtp://..." value
+     * after the push actually stopped would be a lie. */
+    tuner_lock(t);
+    snprintf(t->target, sizeof(t->target), "none");
+    tuner_unlock(t);
+
     tuner_release(t); /* closes ds internally */
 done_no_claim:
     free(ctx);
@@ -157,6 +168,19 @@ int udp_push_start(const struct hdhr_config *cfg, struct hdhr_tuner *t,
     ctx->program_override = t->program;
     snprintf(ctx->dest_ip, sizeof(ctx->dest_ip), "%s", dest_ip);
     ctx->dest_port = dest_port;
+
+    /* Binary form of the destination, for keepalive.c to match incoming
+     * client keepalive packets against — see tuner.h's
+     * keepalive_match_addr/port comment. Failure to parse just leaves
+     * it as 0.0.0.0:0, which won't match any real client's source
+     * address, so a bad IP here degrades to "never reclaimed" rather
+     * than a crash; dvb_stream_open() inside the push thread will
+     * separately fail/log on a genuinely bad destination once it
+     * actually tries to use dest_ip. */
+    struct in_addr addr;
+    t->keepalive_match_addr = (inet_pton(AF_INET, dest_ip, &addr) == 1) ? addr.s_addr : 0;
+    t->keepalive_match_port = (uint16_t)dest_port;
+    clock_gettime(CLOCK_MONOTONIC, &t->last_keepalive_time); /* grace period starts now */
 
     t->udp_push_stop_requested = 0;
     t->udp_push_active = 1;

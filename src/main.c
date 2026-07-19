@@ -27,6 +27,7 @@
 #include "discovery.h"
 #include "control.h"
 #include "http_server.h"
+#include "keepalive.h"
 #include "dvb_scan.h"
 #include "dvb_frontend.h"
 #include "dvb_channel.h"
@@ -144,6 +145,7 @@ int main(int argc, char **argv)
     pthread_create(&th_discovery, NULL, discovery_thread_main, &g_cfg);
     pthread_create(&th_control, NULL, control_thread_main, &ctl);
     pthread_create(&th_http, NULL, http_thread_main, &ctl);
+    keepalive_listener_start(g_tuners, g_cfg.tuner_count);
 
     if (g_cfg.scan_on_startup) {
         pthread_create(&th_scan, NULL, scan_thread_main, NULL);

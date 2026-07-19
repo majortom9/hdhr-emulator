@@ -113,6 +113,29 @@ struct hdhr_tuner {
     volatile int udp_push_active;
     volatile int udp_push_stop_requested;
     pthread_t    udp_push_thread;
+
+    /* Destination of the current target= UDP push, in binary form, set
+     * by udp_push_start() before the push thread starts (valid only
+     * while udp_push_active is true). Lets keepalive.c's listener
+     * match an incoming client keepalive packet's source address
+     * against the right tuner in O(1) without re-parsing `target`'s
+     * string form on every packet. keepalive_match_addr is network
+     * byte order (matches sockaddr_in.sin_addr.s_addr directly);
+     * keepalive_match_port is host byte order. */
+    uint32_t keepalive_match_addr;
+    uint16_t keepalive_match_port;
+
+    /* Monotonic timestamp of the most recent client keepalive packet
+     * matched to this tuner's active push, or of push start if none
+     * has arrived yet (see udp_push_start()) — real libhdhomerun
+     * clients send one every ~1s while streaming
+     * (hdhomerun_video_thread_send_keepalive()) so control.c/udp_stream.c
+     * used to have no way to notice a client that died uncleanly
+     * (crash, kill -9, network drop) and never sent target=none;
+     * without this the tuner stayed locked to a dead destination
+     * forever. keepalive.c reclaims it once too much time passes
+     * without a match. Guarded by `lock` like every other field here. */
+    struct timespec last_keepalive_time;
 };
 
 /* cfg supplies each slot's physical adapter number (cfg->dvb_adapter[i]). */
