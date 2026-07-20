@@ -115,8 +115,10 @@ touching `control.c`'s channel-SET code.
 ### The hardware constraint
 
 This project's `lgdt3306a` demodulator driver retries a lock internally
-**inside a single ioctl call**, several times, before giving up on a dead
-frequency — confirmed via `dmesg` (`lgdt3306a_search: loop=0..4`) and via
+**inside a single ioctl call**, 5 times (`lgdt3306a_search: loop=0`
+through `loop=4` — easy to misread the `0..4` range as 4 attempts, but
+that's 5 inclusive), before giving up on a dead frequency — confirmed
+via `dmesg` and via
 `/proc/<tid>/stat` showing the calling thread in `D` (uninterruptible
 sleep) state for the whole duration. This is not abortable from userspace
 by any means — not a closed fd, not a signal (a `SIGUSR1`+`pthread_kill`
