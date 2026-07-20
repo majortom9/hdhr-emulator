@@ -304,18 +304,37 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * the top. -43.0 dBm is the average of each sample's implied
      * ceiling (100*(dbm-floor)/pct + floor, floor held at -85), and
      * roughly halves the average error across all 7 points (10.9 -> 3.6
-     * pct-point average |delta|). Only 7 data points, all from one
-     * antenna/splitter setup and none near actual lock-loss, so this
-     * remains an approximation, not an exact match — re-run the sweep
-     * against more/weaker real channels if it drifts again. The floor
-     * (-85 dBm = 0%) is unchanged: still a judgment call based on
-     * typical ATSC 8VSB tuner sensitivity specs (usable lock generally
-     * extends to roughly -83 to -90 dBm before the AGC maxes out), not
-     * verified by this sweep (no marginal-signal samples were
-     * available). Enable debug_signal_stats=1 and compare against a
-     * real HDHomeRun on the same antenna feed to refine either further. */
+     * pct-point average |delta|).
+     *
+     * Floor recalibrated 2026-07-19, same real HDHomeRun3/same antenna
+     * feed, but this time sampling across three preamp output levels
+     * (0/9/19 dBmV, adjusted remotely between sweeps) to get real-signal
+     * data across a much wider dBm range than one static antenna setup
+     * could provide — including, for the first time, points weak enough
+     * to actually probe the floor rather than just the ceiling. The
+     * -43.0 ceiling held up well at this pass (implied ceiling from the
+     * new data lands within ~1-2 dBm of it), but a clear trend showed up
+     * in the floor: comparing emu vs. real ss% at each level, the
+     * average delta was -8.7 points at 0 dBmV (weakest), -3.4 at 9 dBmV,
+     * and ~-1 at 19 dBmV (only one usable unclipped point at the
+     * strongest level, both other channels saturated to 100% on *both*
+     * devices — real hardware clips too, not just this emulator) — i.e.
+     * emu under-read more the weaker the signal got, which is exactly
+     * the shape a too-low (too negative) floor produces. Solving for an
+     * implied floor the same way the ceiling was solved (holding -43.0
+     * fixed) across the 11 usable points gave a noisy spread (-73 to
+     * -110 dBm, averaging ~-94) — that inversion is numerically touchy
+     * away from the extremes, so treat the exact number skeptically, but
+     * the direction was consistent enough to act on. Moved -85 -> -90
+     * dBm: a deliberately conservative step in the indicated direction
+     * rather than jumping straight to the noisy -94 average. Still no
+     * sample near actual lock-loss (every real channel gathered so far
+     * locked solidly), so the true floor remains somewhat of an
+     * educated guess — re-run tools/calibrate_stats.c's sweep against a
+     * real device if it drifts again, ideally with a genuinely marginal
+     * channel in the mix next time. */
     out->signal_strength_pct = read_stat_property(fd, DTV_STAT_SIGNAL_STRENGTH,
-                                                   "signal_strength", -85.0, -43.0);
+                                                   "signal_strength", -90.0, -43.0);
     /* Calibrated against a real HDHomeRun with two reference points:
      * snq=100% at 33dB SNR (the ceiling), and snq clustering ~35-40% at
      * 15.2dB SNR. Solving for the floor that satisfies both (using the
