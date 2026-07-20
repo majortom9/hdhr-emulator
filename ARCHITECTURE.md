@@ -531,7 +531,52 @@ available* reading at `1` instead of `0` (used by `scale_decibel_to_pct()`,
 cases gets to keep `0`, this daemon just never emits it in these fields
 at all.
 
-## 14. Debugging techniques that worked, worth reusing
+## 14. Raw signal-strength dBm is an AGC readout, not a power measurement
+
+Worth internalizing before trusting `DTV_STAT_SIGNAL_STRENGTH` too
+literally: the kernel DVBv5 API defines its decibel scale as "0.001 dBm
+units, power" (see `dvb_frontend_read_stats()`'s own comment), which
+reads like an absolute, calibrated measurement at the antenna
+connector. It isn't, in practice. There's an AGC (automatic gain
+control) loop between the tuner IC's variable-gain stages and the
+demod — the demod (or sometimes the tuner) reads back whatever gain
+setting the loop settled on to hit its target signal level, and the
+driver converts *that* into a "dBm" number via its own lookup
+table/formula. The number reported is downstream of that conversion,
+not an independent measurement of what's actually arriving at the
+F-connector.
+
+This matters because the AGC-to-dBm conversion is characterized
+per-driver, per-tuner-IC — two different tuners can legitimately report
+different "dBm" for identical real RF power, and there's no way to tell
+from the number alone whether that's a real difference in received
+power or just a difference in how optimistically each driver's author
+calibrated their conversion table. Confirmed directly: comparing
+pi3b's tuner against a physically different USB ATSC dongle (`pi4`,
+same LGDT3306A demod, different tuner front-end IC) on the same
+antenna/preamp feed across three signal levels, pi3b consistently
+reported ~6.9 dB *stronger* ss than pi4 for the identical actual
+signal — yet at the weakest tested level, pi3b locked fewer real
+channels than pi4 did (4/35 vs. 9/35), not more. The two metrics
+flatly disagreed: the tuner with the more optimistic self-reported dBm
+number was the one that actually struggled more. Whatever's costing
+pi3b real sensitivity there isn't visible in its own dBm number, since
+that number was never an independent measurement to begin with — see
+`pi3b_vs_pi4_report_2026-07-19.md` (generated during this comparison,
+not committed to the repo) for the full per-channel data.
+
+Practical consequence: this is exactly why this project's own
+`signal_strength_pct` floor/ceiling calibration (see the comments
+above that field in `dvb_frontend_read_stats()`, and README.md's
+"Calibrating signal stats against real hardware") has to be validated
+against a real device's actual `ss%`/lock *behavior*, not treated as a
+matter of getting the "true" dBm-to-percent conversion right in some
+absolute sense — there isn't one. A calibration pass tuned against one
+tuner's AGC characteristics doesn't transfer to a different tuner IC
+without its own real-device comparison, even when both run the same
+demod chip.
+
+## 15. Debugging techniques that worked, worth reusing
 
 - **`/proc/<pid>/task/*/stat` sampling** (`ps -eLo tid,stat,wchan,comm`,
   ~100ms interval, piped to a log file, run *concurrently* with a failing
