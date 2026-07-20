@@ -28,6 +28,15 @@
 #define LOCK_TIMEOUT_MS 2000
 #define FULL_MUX_PID 0x2000 /* DVB API wildcard: "all PIDs" full-TS passthrough */
 #define MIN_WINDOW_SEC 1.0  /* dvb_stream_get_rate()'s minimum sampling window — see its comment */
+/* Real firmware's "packet" unit for /tunerN/status's pps= field: 7
+ * 188-byte MPEG-TS packets bundled into one 1316-byte chunk — the
+ * classic early-HDHomeRun UDP datagram packing (see udp_stream.c's own
+ * identical DATAGRAM_SIZE), used as pps='s unit here even for HTTP
+ * passthrough, which has no actual 1316-byte framing of its own. Not
+ * shared with udp_stream.c's constant directly — dvb_stream.c
+ * shouldn't depend on udp_stream.c, wrong layering direction — but
+ * must stay numerically identical to it. */
+#define STATUS_PACKET_UNIT_BYTES (188 * 7)
 
 struct dvb_stream {
     int frontend_fd;
@@ -446,19 +455,30 @@ void dvb_stream_get_rate(const struct dvb_stream *s, double *bits_per_second,
      * between windows so back-to-back status polls don't divide by
      * near-zero and produce a noisy/inflated instantaneous spike.
      *
-     * 200ms used to be the guard here, but that's short enough to catch
-     * real DVB delivery's natural burstiness (the kernel/USB driver
-     * hands packets to us in chunks, not a smooth trickle) as if it
-     * were the actual rate — confirmed live: a real HDHomeRun-emulated
-     * stream at a true ~6 Mbps (measured independently via a plain curl
-     * pull) reported spikes up to ~45 Mbps in hdhomerun_config_gui,
-     * which polls /tunerN/status very frequently from more than one
-     * persistent connection at once. A full second gives the window
-     * enough real data to average the bursts out. */
+     * 200ms used to be the guard here; widened to a full second on the
+     * theory that it was too short to average out real DVB delivery's
+     * natural burstiness. That theory was wrong, or at least incomplete
+     * — confirmed 2026-07-20: hdhomerun_config_gui's "Network Rate"
+     * field is computed client-side from *our* pps= alone
+     * (packets_per_second * 1316 * 8, see its HDHRConfig.cpp), not from
+     * our bps= field at all, and this pps= was counting raw 188-byte
+     * MPEG-TS packets instead of 1316-byte UDP datagrams (7 TS packets
+     * each — real firmware's actual meaning of "packet" in this field,
+     * confirmed by that same GUI formula, and matching this project's
+     * own DATAGRAM_SIZE in udp_stream.c). Since 1316 = 7*188, that's a
+     * flat, systematic 7x inflation on every single reading, regardless
+     * of window length or polling pattern — not a burst-averaging
+     * problem, which is exactly why the 1s-window change alone never
+     * fixed it, and why plain `hdhomerun_config get /tunerN/status`
+     * never surfaced it either (it just prints bps= verbatim, which was
+     * already correct; nobody was hand-computing pps*1316*8 to notice
+     * pps= itself was wrong). Widening the window was still a
+     * legitimate improvement for the bps= field's own real jitter, so
+     * left as-is. */
     if (elapsed >= MIN_WINDOW_SEC) {
         uint64_t delta_bytes = bytes_now - window_bytes;
         ns->last_bps = (delta_bytes * 8.0) / elapsed;
-        ns->last_pps = (delta_bytes / 188.0) / elapsed;
+        ns->last_pps = (delta_bytes / (double)STATUS_PACKET_UNIT_BYTES) / elapsed;
 
         ns->window_start_bytes = bytes_now;
         ns->window_start_time = now;
