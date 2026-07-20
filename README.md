@@ -128,6 +128,10 @@ values are the genuine ones, not guessed):
 - `dvb_frontend.c` — S2API tuning/status/stats
 - `mpeg_section.c` — demux section-filter setup
 - `dvb_stream.c` — demux PES-filter setup, DVR device capture
+- `dvb_frontend_tune_qam()` (QAM/cable) — `SYS_DVBC_ANNEX_B` and
+  `QAM_AUTO` resolve against this project's own DVB hardware's kernel
+  headers, but the tune has never actually been attempted against real
+  cable signal — see "Known simplifications" and ARCHITECTURE.md
 
 **Unit-tested with synthetic data, no hardware needed:**
 - `psip.c` — PAT/PMT/TVCT parsing (`make test`)
@@ -293,9 +297,14 @@ src/
                       network drop) once its keepalive packets stop
   pid_filter.*        /tunerN/filter wire-format parsing + formatting
                        ("0x<nnnn>[-0x<nnnn>] ..." PID lists)
-  atsc_freq.*        US ATSC RF channel -> frequency table (public FCC
-                      channel plan)
-  dvb_frontend.*      Linux DVB S2API: tune 8VSB, read lock + signal stats
+  atsc_freq.*        US ATSC (us-bcast) RF channel -> frequency table
+                      (public FCC channel plan) -- the one channel map
+                      that's actually real-hardware validated
+  channel_map.*       the other five channel maps (us-cable/us-hrc/
+                      us-irc/kr-bcast/kr-cable) -- range-based
+                      frequency tables verified against libhdhomerun's
+                      source, UNTESTED against real signal
+  dvb_frontend.*      Linux DVB S2API: tune 8VSB or QAM, read lock + signal stats
   mpeg_section.*      demux section-filter wrapper (PAT/PMT/PSIP reads)
   psip.*              pure PAT/PMT/ATSC-TVCT section parsers
   dvb_channel.*       virtual channel database (major.minor -> PIDs/freq)
@@ -356,7 +365,18 @@ ARCHITECTURE.md         deeper technical detail — the "why" behind the
   empty lineup until next restart; there's no runtime "trigger a
   rescan" control yet (`dvb_scan_run()` exists and could be wired to
   one easily — see main.c's `scan_thread_main`).
-- **8VSB (US OTA) only** — no QAM/cable support, per project scope.
+- **QAM/cable support (`us-cable`/`us-hrc`/`us-irc`/`kr-bcast`/`kr-cable`)
+  is UNTESTED against real signal** — implemented (frequency tables,
+  QAM tuning, CVCT parsing, a no-CVCT raw-program-number fallback) but
+  never locked a real channel, unlike `us-bcast`'s thorough real-hardware
+  validation. See "What's compile-verified vs. what needs real hardware"
+  above and [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
+  its open questions. Also: the shared channel database keys on
+  major.minor alone, so scanning two different channelmaps that happen
+  to produce the same major.minor (e.g. via the no-CVCT fallback, or
+  genuine coincidence) would silently overwrite one with the other —
+  not a concern for the single-channelmap-at-a-time usage this project
+  has actually been used with so far.
 - **Full-mux passthrough** (`program=0`, or an explicit `/tunerN/filter`
   wide enough that it can't be enumerated as individual demux PID
   filters — see `dvb_stream.c`'s `MAX_DEMUX_FDS`) relies on the DVB

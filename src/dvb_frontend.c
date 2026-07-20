@@ -62,6 +62,60 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
     return 0;
 }
 
+/* US/KR in-band clear QAM cable, per channel_map.h's cable maps
+ * (us-cable/us-hrc/us-irc/kr-cable) — UNTESTED against real cable
+ * signal, unlike dvb_frontend_tune_8vsb() above (see README.md's
+ * "What's compile-verified vs. what needs real hardware" section).
+ *
+ * SYS_DVBC_ANNEX_B is the Linux DVB API's delivery system for this
+ * (ITU-T J.83 Annex B, the North American cable QAM variant — Annex A
+ * is the different European one). Confirmed present as an available
+ * delivery system on this project's own LGDT3306A frontends via
+ * `dvb-fe-tool` (alongside ATSC) — the demod chip supports it, this is
+ * purely a software gap being filled in.
+ *
+ * QAM_AUTO lets the driver blind-detect 64-QAM vs. 256-QAM rather than
+ * the caller needing to know which a given channel actually uses (real
+ * cable operators mix both freely, sometimes on the same system) — the
+ * same "don't make the caller pre-know something the hardware can
+ * figure out" spirit as tune_8vsb() not taking a modulation parameter
+ * either. 5360537 (5.360537 Msym/s) is the standard/near-universal
+ * symbol rate for 6MHz-spaced North American in-band clear QAM,
+ * regardless of 64 vs. 256 constellation — the value essentially every
+ * consumer QAM tuner defaults to for a scan. */
+#define HDHR_QAM_SYMBOL_RATE 5360537
+
+int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz)
+{
+    struct dtv_property props[5];
+    memset(props, 0, sizeof(props));
+
+    props[0].cmd = DTV_CLEAR;
+    props[1].cmd = DTV_DELIVERY_SYSTEM;
+    props[1].u.data = SYS_DVBC_ANNEX_B;
+    props[2].cmd = DTV_MODULATION;
+    props[2].u.data = QAM_AUTO;
+    props[3].cmd = DTV_SYMBOL_RATE;
+    props[3].u.data = HDHR_QAM_SYMBOL_RATE;
+    props[4].cmd = DTV_FREQUENCY;
+    props[4].u.data = frequency_hz;
+
+    struct dtv_properties clear_and_set = { .num = 5, .props = props };
+    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_set) < 0) {
+        fprintf(stderr, "dvb_frontend: FE_SET_PROPERTY QAM (freq=%u) failed: %s\n",
+                frequency_hz, strerror(errno));
+        return -1;
+    }
+
+    struct dtv_property tune_prop = { .cmd = DTV_TUNE };
+    struct dtv_properties tune = { .num = 1, .props = &tune_prop };
+    if (ioctl(fd, FE_SET_PROPERTY, &tune) < 0) {
+        fprintf(stderr, "dvb_frontend: DTV_TUNE (QAM) failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* How often the (potentially expensive) progress callback actually
  * fires, vs. how often we poll FE_READ_STATUS (step_ms). Calling it on
  * every single poll tick turned out to be a real problem: the callback

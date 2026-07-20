@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "channel_map.h"
 
 #define DVB_CHANNEL_MAX 256
 
@@ -10,9 +11,20 @@ struct dvb_channel {
     int      major;
     int      minor;
     char     short_name[16];
-    int      rf_channel;    /* physical RF channel number (2-36), for the
-                              * "us-bcast:N" format real firmware uses in
-                              * /tunerN/channel — see tuner_bind_channel() */
+    int      rf_channel;    /* physical RF channel number, for the
+                              * "<channelmap>:N" format real firmware uses
+                              * in /tunerN/channel — see tuner_bind_channel() */
+    enum hdhr_delivery_system delivery; /* HDHR_DELIVERY_ATSC_VSB or
+                                          * HDHR_DELIVERY_QAM — which tune
+                                          * function dvb_stream_open() must
+                                          * use to actually stream this
+                                          * channel later, since a stream
+                                          * open only gets a dvb_channel
+                                          * pointer, not the channelmap it
+                                          * was scanned under. Set once at
+                                          * scan time (dvb_scan.c) and
+                                          * never changes for a given
+                                          * major.minor. */
     uint32_t frequency_hz;
     uint16_t channel_tsid;  /* transport_stream_id, for streaminfo's "tsid=" line */
     uint16_t program_number;

@@ -576,7 +576,102 @@ tuner's AGC characteristics doesn't transfer to a different tuner IC
 without its own real-device comparison, even when both run the same
 demod chip.
 
-## 15. Debugging techniques that worked, worth reusing
+## 15. QAM/cable channel maps — implemented, UNTESTED against real signal
+
+Everything in this section is compile-verified against this project's
+own DVB hardware's kernel headers, and the frequency data is verified
+against a real source (see below) — but none of it has ever actually
+locked a real cable channel, unlike `us-bcast`'s thorough real-hardware
+validation throughout the rest of this document. Treat it accordingly.
+
+**Frequency tables** (`channel_map.c`/`.h`): a genuine HDHomeRun3's own
+`get help` lists six channel maps (`us-bcast us-cable us-hrc us-irc
+kr-bcast kr-cable`); `us-bcast` already had its own real-hardware-
+validated table (`atsc_freq.c`) and was deliberately left alone rather
+than folded into this more general system. The other five come from a
+real copy of `libhdhomerun`'s `hdhomerun_channels.c`
+(`hdhomerun_channelmap_range_*` tables) — protocol facts (channel
+ranges, base frequencies, per-channel spacing), not copied code, same
+clean-room approach as the rest of this project (see README.md). One
+useful simplification fell out of that source directly: `kr-bcast`
+isn't a distinct Korean frequency plan at all — libhdhomerun points it
+at the exact same range table as `us-bcast`, just under a different
+country-code label, so `channel_map.c` does the same rather than
+maintaining a duplicate table.
+
+**QAM tuning** (`dvb_frontend_tune_qam()`): `SYS_DVBC_ANNEX_B` (the
+Linux DVB API's North American cable QAM delivery system — confirmed
+present as an available delivery system on this project's own
+LGDT3306A frontends via `dvb-fe-tool`, alongside ATSC) with
+`QAM_AUTO` modulation and a fixed 5.360537 Msym/s symbol rate — the
+near-universal standard for 6MHz-spaced North American in-band clear
+QAM regardless of 64- vs. 256-QAM constellation. `QAM_AUTO` means the
+driver blind-detects which constellation a given channel actually
+uses, same "don't make the caller pre-know something the hardware can
+figure out" spirit as `dvb_frontend_tune_8vsb()` not taking a
+modulation parameter either — real cable operators mix 64-QAM and
+256-QAM freely, sometimes on the same system.
+
+**CVCT reuse**: ATSC A/65's CVCT (cable virtual channel table, table_id
+`0xC9`) shares TVCT's (`0xC8`, terrestrial) wire format byte-for-byte —
+`psip_parse_tvct()` doesn't even check `table_id` internally, so
+`dvb_scan.c`'s `read_vct()` just opens a section filter on whichever
+table_id the delivery system calls for and feeds it the same parser.
+
+**No-CVCT fallback**: real cable operators inconsistently carry usable
+CVCT at all. Dropping an entire mux just because PSIP isn't present
+would throw away real, playable programs that PAT+PMT already resolved
+fine — `dvb_scan_read_psip()` falls back to exposing each such program
+directly as `<rf_channel>.<program_number>` (e.g. `"24.3"`) rather than
+skipping it, matching how real hardware/software (e.g. TVheadend)
+commonly handles PSIP-less clear QAM.
+
+**Delivery system travels with the channel, not the tuner**:
+`dvb_stream_open()` (the actual streaming tune, shared by `target=` and
+HTTP pulls — see §8) only ever receives a `struct dvb_channel` pointer,
+not whatever channelmap was active when that channel was originally
+scanned. So `dvb_channel` itself carries a `delivery` field
+(`HDHR_DELIVERY_ATSC_VSB`/`HDHR_DELIVERY_QAM`), stamped once at scan
+time (`dvb_scan.c`) and read back by `dvb_stream_open()` to pick the
+right tune function — without this, a scanned QAM channel would
+correctly show up in the lineup but then fail to actually stream, since
+the frontend would try to tune it as 8VSB.
+
+**Channel-value parsing is channelmap-aware, but decoupled from the
+value's own prefix**: `control.c`'s `parse_channel_value()` takes the
+tuner's *currently active* `/tunerN/channelmap` as a parameter, and
+`"auto:<N>"`/`"8vsb:<freq>"`/`"qam:<freq>"` all resolve against
+whichever map that is — matching real behavior, where the modulation
+actually used for tuning is driven by what `/tunerN/channelmap` is
+configured to, not by which prefix string a client happened to send.
+An explicit `"<mapname>:N"` prefix (e.g. `"us-cable:23"`) overrides
+that and resolves against the named map regardless of what's currently
+active — this is what the smoke test below actually exercised.
+Setting `/tunerN/channelmap` itself clears any tuned channel/vchannel
+state, since a channel *number* means something different in every map
+(e.g. "7" is 177MHz in `us-bcast` but a different frequency in
+`us-irc`).
+
+**What was actually checked, and what wasn't**: with no real cable
+feed available, verification stopped at compiling cleanly against real
+kernel headers on both target Pis, and a live smoke test confirming the
+plumbing doesn't crash or misbehave: `/sys/features` matches a real
+device's exact response, `/tunerN/channelmap` GET/SET works and rejects
+unknown maps, and `set /tunerN/channel us-cable:23` correctly resolved
+to exactly 219000000 Hz (matching the verified table), attempted a real
+`SYS_DVBC_ANNEX_B` tune, and failed to lock *gracefully* (no signal —
+expected) with a correctly `"qam:"`-prefixed status string, all without
+disturbing the daemon's other tuner or crashing. None of that proves
+the QAM tuning parameters, CVCT parsing, or the no-CVCT fallback are
+actually *correct* against a real cable signal — only that they don't
+fall over. The `"qam:<freq_hz>"` string this daemon echoes back for
+`/tunerN/channel` on a locked cable channel is also an unverified
+guess at what real firmware would report (the ATSC equivalent,
+`"8vsb:<freq_hz>"`, was confirmed against a real device's actual
+display; there was no real cable-tuned device available to confirm
+against here).
+
+## 16. Debugging techniques that worked, worth reusing
 
 - **`/proc/<pid>/task/*/stat` sampling** (`ps -eLo tid,stat,wchan,comm`,
   ~100ms interval, piped to a log file, run *concurrently* with a failing

@@ -26,6 +26,12 @@ void dvb_frontend_close(int fd);
  * 0 on success, -1 on ioctl failure (errno set). */
 int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz);
 
+/* Same shape as dvb_frontend_tune_8vsb(), but for in-band clear QAM
+ * cable (US/KR — SYS_DVBC_ANNEX_B, QAM_AUTO). UNTESTED against real
+ * cable signal — see the comment above its implementation in
+ * dvb_frontend.c. */
+int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz);
+
 /* Called once per poll iteration inside dvb_frontend_wait_lock(), from
  * the SAME thread that owns fd (never a different thread) — see that
  * function's own comment for why this matters. */

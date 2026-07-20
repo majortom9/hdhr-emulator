@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #include "dvb_frontend.h"
+#include "channel_map.h"
 
 /* Tunes through every table entry in atsc_freq_table on the given
  * adapter/frontend/demux, and for each frequency that locks, parses
@@ -36,8 +37,14 @@ int dvb_scan_run(int adapter, int frontend, int demux_num);
  * a latency-sensitive path (e.g. a control-protocol reply) should run
  * this in a background thread and bound their own wait with a condition
  * variable rather than assuming this call itself is bounded — see
- * control.c's /tunerN/channel SET handler for the pattern. */
-bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd,
+ * control.c's /tunerN/channel SET handler for the pattern.
+ *
+ * `delivery`: HDHR_DELIVERY_ATSC_VSB tunes 8VSB (this project's
+ * original, real-hardware-validated path); HDHR_DELIVERY_QAM tunes
+ * in-band clear QAM for the cable channel maps -- UNTESTED against
+ * real cable signal, see channel_map.h. */
+bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz,
+                             enum hdhr_delivery_system delivery, int *out_ffd,
                              dvb_frontend_progress_cb progress_cb, void *progress_ctx);
 
 /* Reads PAT+PMT+TVCT off an already-locked frontend (ffd, as returned by
@@ -46,9 +53,23 @@ bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *ou
  * place rather than duplicating them — safe to call repeatedly on the
  * same frequency). Always closes ffd before returning, whether or not
  * anything usable was found. `rf_channel` is the RF channel number
- * (2-36) to record on any channels found, for the "us-bcast:N"
- * /tunerN/channel format — pass 0 if unknown. Returns the number of
- * channels added. Blocks for up to a few seconds. */
-int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq_hz, int ffd);
+ * to record on any channels found, for the "<channelmap>:N"
+ * /tunerN/channel format -- pass 0 if unknown.
+ *
+ * `delivery` selects which PSIP table to read: HDHR_DELIVERY_ATSC_VSB
+ * reads TVCT (table_id 0xC8, terrestrial); HDHR_DELIVERY_QAM reads CVCT
+ * (table_id 0xC9, cable) -- structurally identical wire format per ATSC
+ * A/65, see psip.c. Real cable operators inconsistently carry usable
+ * CVCT at all; if HDHR_DELIVERY_QAM and no CVCT is found but PAT/PMT
+ * did resolve real programs, falls back to exposing each program
+ * directly as "<rf_channel>.<program_number>" (major.minor) rather
+ * than dropping the mux entirely -- matches how real hardware/software
+ * (e.g. TVheadend) commonly handles PSIP-less clear QAM. This fallback
+ * path is UNTESTED against real cable signal.
+ *
+ * Returns the number of channels added. Blocks for up to a few
+ * seconds. */
+int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq_hz,
+                        enum hdhr_delivery_system delivery, int ffd);
 
 #endif /* HDHR_DVB_SCAN_H */

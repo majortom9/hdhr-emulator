@@ -39,6 +39,19 @@ struct hdhr_tuner {
     char     target[64];
     uint32_t lockkey;
 
+    /* /tunerN/channelmap — which channel map (see channel_map.h)
+     * "us-bcast:<N>"/plain channel-number tuning gets resolved against.
+     * "us-bcast" (this project's original, thoroughly real-hardware-
+     * validated ATSC-only scope) is the default and isn't itself in
+     * channel_map.c's table (that module only covers the other five —
+     * see its own header comment); the other five (us-cable/us-hrc/
+     * us-irc/kr-bcast/kr-cable) are UNTESTED against real signal.
+     * Changing this clears channel/vchannel state, same as a frequency
+     * change, since a channel *number* means something different in
+     * every map (e.g. "7" is 177MHz in us-bcast but a different
+     * frequency in us-irc). */
+    char     channelmap[16];
+
     /* /tunerN/filter's explicit PID override, in wire format (see
      * pid_filter.h) — "" (empty) means "not set", i.e. PID selection
      * falls back to program's normal resolution. Confirmed against a

@@ -120,6 +120,7 @@
 #include "atsc_freq.h"
 #include "udp_stream.h"
 #include "pid_filter.h"
+#include "channel_map.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -271,14 +272,16 @@ static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *na
          * available maps and valid channel-number range; without it in
          * the expected format, the selector showed blank and its
          * channel spinner fell back to a meaningless default (observed:
-         * stuck at 255). Scoped to just what we actually support
-         * (8VSB/US-OTA only, per project scope) rather than echoing a
-         * real device's full multi-standard list (us-cable, qam256,
-         * etc.) which we can't actually tune. */
+         * stuck at 255). Byte-for-byte the same as the real device's own
+         * value (matching it was cheap; unlike copying its /sys/copyright
+         * text, listing capabilities the hardware genuinely has isn't a
+         * false authorship claim). us-cable/us-hrc/us-irc/kr-bcast/
+         * kr-cable and qam64/qam256 are UNTESTED against real signal —
+         * see channel_map.h and dvb_frontend_tune_qam()'s own comments. */
         send_value_reply(fd, name,
-            "channelmap: us-bcast\n"
-            "modulation: 8vsb\n"
-            "auto-modulation: auto\n");
+            "channelmap: us-bcast us-cable us-hrc us-irc kr-bcast kr-cable\n"
+            "modulation: 8vsb qam256 qam64\n"
+            "auto-modulation: auto auto6t auto6c qam\n");
     } else {
         send_error_reply(fd, name, "ERROR: parameter is read-only or unknown");
     }
@@ -376,9 +379,7 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
     if (strcmp(leaf, "channel") == 0) {
         snprintf(val, sizeof(val), "%s", t->channel);
     } else if (strcmp(leaf, "channelmap") == 0) {
-        /* Only one channelmap supported (8VSB/US-OTA only, per project
-         * scope) — see atsc_freq.h. */
-        snprintf(val, sizeof(val), "us-bcast");
+        snprintf(val, sizeof(val), "%s", t->channelmap);
     } else if (strcmp(leaf, "vchannel") == 0) {
         if (t->vch_resolved) {
             snprintf(val, sizeof(val), "%d.%d", t->vch_major, t->vch_minor);
@@ -510,7 +511,41 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
     send_value_reply(fd, name, val);
 }
 
-static bool parse_channel_value(const char *value, uint32_t *out_freq, int *out_rf_channel)
+/* channel_map.c's table covers everything except "us-bcast" (see its
+ * own header comment — that map stays on the original, real-hardware-
+ * validated atsc_freq.h/.c instead of being folded in). These three
+ * helpers paper over that split so callers below don't need to special-
+ * case "us-bcast" themselves every time. */
+static uint32_t resolve_channel_in_map(const char *map_name, int channel)
+{
+    if (strcmp(map_name, "us-bcast") == 0) return atsc_channel_to_freq(channel);
+    const struct channel_map_def *map = channel_map_find(map_name);
+    return map ? channel_map_channel_to_freq(map, channel) : 0;
+}
+
+static int reverse_resolve_freq_in_map(const char *map_name, uint32_t freq)
+{
+    if (strcmp(map_name, "us-bcast") == 0) return atsc_freq_to_channel(freq);
+    const struct channel_map_def *map = channel_map_find(map_name);
+    return map ? channel_map_freq_to_channel(map, freq) : 0;
+}
+
+static enum hdhr_delivery_system delivery_for_map(const char *map_name)
+{
+    if (strcmp(map_name, "us-bcast") == 0) return HDHR_DELIVERY_ATSC_VSB;
+    const struct channel_map_def *map = channel_map_find(map_name);
+    return map ? map->delivery : HDHR_DELIVERY_ATSC_VSB; /* shouldn't happen; safe default */
+}
+
+/* `channelmap` is the tuner's *currently active* /tunerN/channelmap
+ * (see tuner.h) — resolves "auto:"/"8vsb:"/"qam:" (and a bare small
+ * "auto:N" channel number) against whichever map that is, so the same
+ * value works regardless of which map happens to be selected. An
+ * explicit "<mapname>:N" prefix (e.g. "us-cable:23") overrides that and
+ * resolves against the named map instead, independent of what's
+ * currently active. */
+static bool parse_channel_value(const char *channelmap, const char *value,
+                                 uint32_t *out_freq, int *out_rf_channel)
 {
     if (strncmp(value, "auto:", 5) == 0) {
         uint32_t n = (uint32_t)strtoul(value + 5, NULL, 10);
@@ -531,32 +566,49 @@ static bool parse_channel_value(const char *value, uint32_t *out_freq, int *out_
          * any real RF frequency is tens of millions of Hz, so a low
          * threshold unambiguously separates the two forms. */
         if (n < 1000) {
-            uint32_t freq = atsc_channel_to_freq((int)n);
+            uint32_t freq = resolve_channel_in_map(channelmap, (int)n);
             if (freq == 0) return false; /* unknown/out-of-range channel number */
             *out_freq = freq;
             *out_rf_channel = (int)n;
             return true;
         }
         *out_freq = n;
-        *out_rf_channel = atsc_freq_to_channel(n); /* 0 if not an exact table match — still fine to tune */
+        *out_rf_channel = reverse_resolve_freq_in_map(channelmap, n); /* 0 if not an exact table match — still fine to tune */
         return true;
     }
-    if (strncmp(value, "8vsb:", 5) == 0) {
-        /* Unlike "auto:", "8vsb:" always means an explicit frequency
-         * (modulation:frequency) — no ambiguity to resolve here. */
-        uint32_t freq = (uint32_t)strtoul(value + 5, NULL, 10);
+    if (strncmp(value, "8vsb:", 5) == 0 || strncmp(value, "qam:", 4) == 0) {
+        /* Unlike "auto:", these always mean an explicit frequency
+         * (modulation:frequency) — no ambiguity to resolve here. Both
+         * accepted regardless of active channelmap/delivery, same as a
+         * client re-submitting whatever this daemon itself echoes back
+         * as t->channel. */
+        const char *colon = strchr(value, ':');
+        uint32_t freq = (uint32_t)strtoul(colon + 1, NULL, 10);
         if (freq == 0) return false;
         *out_freq = freq;
-        *out_rf_channel = atsc_freq_to_channel(freq);
+        *out_rf_channel = reverse_resolve_freq_in_map(channelmap, freq);
         return true;
     }
-    if (strncmp(value, "us-bcast:", 9) == 0) {
-        int ch = atoi(value + 9);
-        uint32_t freq = atsc_channel_to_freq(ch);
-        if (freq == 0) return false; /* unknown/out-of-range channel number */
-        *out_freq = freq;
-        *out_rf_channel = ch;
-        return true;
+
+    /* Explicit "<mapname>:N" — e.g. "us-cable:23" — independent of
+     * whatever channelmap is currently active. "us-bcast:N" is this
+     * project's original, real-hardware-validated form; the other five
+     * map names route through channel_map.c instead. */
+    const char *colon = strchr(value, ':');
+    if (colon) {
+        size_t prefix_len = (size_t)(colon - value);
+        char prefix[16];
+        if (prefix_len > 0 && prefix_len < sizeof(prefix)) {
+            memcpy(prefix, value, prefix_len);
+            prefix[prefix_len] = '\0';
+            int ch = atoi(colon + 1);
+            uint32_t freq = resolve_channel_in_map(prefix, ch);
+            if (freq != 0) {
+                *out_freq = freq;
+                *out_rf_channel = ch;
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -592,6 +644,7 @@ struct channel_scan_ctx {
     const struct hdhr_config *cfg;
     int rf_channel;
     uint32_t freq;
+    enum hdhr_delivery_system delivery; /* from t->channelmap at SET time — see channel_map.h */
 
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -605,11 +658,18 @@ struct channel_scan_ctx {
  * client already moved on (another /channel SET, or a "none") while we
  * were working, our result is stale and shouldn't clobber the current
  * one. */
-static void finalize_lock_result(struct hdhr_tuner *t, uint32_t freq, bool locked)
+static void finalize_lock_result(struct hdhr_tuner *t, uint32_t freq, bool locked,
+                                  enum hdhr_delivery_system delivery)
 {
     tuner_lock(t);
     if (t->tuned_frequency_hz == freq) {
-        snprintf(t->status, sizeof(t->status), "ch=%s lock=%s", t->channel, locked ? "8vsb" : "none");
+        /* "qam" rather than the specific "qam64"/"qam256" constellation:
+         * we tune with QAM_AUTO (see dvb_frontend_tune_qam()) and don't
+         * read back which one the driver actually locked, unlike 8VSB
+         * where there's only one possibility. UNTESTED against real
+         * cable signal either way. */
+        const char *lock_word = locked ? (delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb") : "none";
+        snprintf(t->status, sizeof(t->status), "ch=%s lock=%s", t->channel, lock_word);
     }
     tuner_unlock(t);
 }
@@ -677,7 +737,8 @@ static void *channel_scan_thread_main(void *arg)
     for (;;) {
         struct scan_progress_ctx pc = { .t = t, .freq = freq };
         int ffd;
-        bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, freq, &ffd,
+        bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, freq,
+                                              ctx->delivery, &ffd,
                                               publish_scan_stats, &pc);
 
         pthread_mutex_lock(&ctx->mutex);
@@ -690,7 +751,7 @@ static void *channel_scan_thread_main(void *arg)
         if (must_finalize) {
             /* The caller already replied without us — this thread now owns
              * reporting the lock result once it's known. */
-            finalize_lock_result(t, freq, locked);
+            finalize_lock_result(t, freq, locked, ctx->delivery);
         }
 
         if (locked) {
@@ -712,7 +773,8 @@ static void *channel_scan_thread_main(void *arg)
             usleep(600 * 1000);
             publish_scan_stats(&pc, ffd);
 
-            dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, rf_channel, freq, ffd);
+            dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, rf_channel, freq,
+                                ctx->delivery, ffd);
         }
 
         /* Dequeue the next queued request (see the FIFO's own comment
@@ -753,7 +815,26 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                               const char *name, const char *leaf, const char *value)
 {
     if (strcmp(leaf, "channelmap") == 0) {
-        send_error_reply(fd, name, "ERROR: only \"us-bcast\" is supported (8VSB/US-OTA only)");
+        if (strcmp(value, "us-bcast") != 0 && !channel_map_find(value)) {
+            send_error_reply(fd, name, "ERROR: unknown channel map");
+            return;
+        }
+        /* Channel *numbers* mean something different in every map (e.g.
+         * "7" is 177MHz in us-bcast but a different frequency in
+         * us-irc), so any previously-tuned channel/vchannel state from
+         * the old map is now meaningless — clear it the same way an
+         * explicit channel=none does, rather than leaving a stale tune
+         * that'll misbehave against the new map's frequency plan. */
+        udp_push_stop(t);
+        tuner_lock(t);
+        snprintf(t->channelmap, sizeof(t->channelmap), "%s", value);
+        snprintf(t->channel, sizeof(t->channel), "none");
+        t->tuned_frequency_hz = 0;
+        t->vch_resolved = false;
+        t->filter_override[0] = '\0';
+        snprintf(t->status, sizeof(t->status), "state=idle");
+        tuner_unlock(t);
+        send_value_reply(fd, name, value);
         return;
     }
 
@@ -797,11 +878,17 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             return;
         }
 
+        char channelmap[16];
+        tuner_lock(t);
+        snprintf(channelmap, sizeof(channelmap), "%s", t->channelmap);
+        tuner_unlock(t);
+        enum hdhr_delivery_system delivery = delivery_for_map(channelmap);
+
         uint32_t freq;
         int rf_channel;
-        if (!parse_channel_value(value, &freq, &rf_channel)) {
+        if (!parse_channel_value(channelmap, value, &freq, &rf_channel)) {
             send_error_reply(fd, name, "ERROR: expected \"none\", \"auto:<freq_hz>\", "
-                                        "or \"us-bcast:<N>\"");
+                                        "or \"<channelmap>:<N>\"");
             return;
         }
 
@@ -866,7 +953,8 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                     t->tuned_frequency_hz = freq;
                     t->vch_resolved = false;
                     t->filter_override[0] = '\0';
-                    snprintf(t->channel, sizeof(t->channel), "8vsb:%u", freq);
+                    snprintf(t->channel, sizeof(t->channel), "%s:%u",
+                             delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
                     snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
                     tuner_unlock(t);
                     send_value_reply(fd, name, t->channel);
@@ -896,8 +984,12 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * *input* syntax for the Channel selector, not what a real
          * device echoes back). rf_channel is still recorded on the
          * dvb_channel entries themselves (see dvb_scan.c) — it's just
-         * not part of this reported string. */
-        snprintf(t->channel, sizeof(t->channel), "8vsb:%u", freq);
+         * not part of this reported string. "qam:<freq_hz>" for the
+         * cable maps is this project's own best guess at the
+         * equivalent — UNTESTED, no real cable-tuned device to confirm
+         * the exact modulation string against (see channel_map.h). */
+        snprintf(t->channel, sizeof(t->channel), "%s:%u",
+                 delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
         snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
         tuner_unlock(t);
 
@@ -906,6 +998,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         ctx->cfg = cfg;
         ctx->rf_channel = rf_channel;
         ctx->freq = freq;
+        ctx->delivery = delivery;
         pthread_mutex_init(&ctx->mutex, NULL);
         pthread_cond_init(&ctx->cond, NULL);
         ctx->lock_known = false;
@@ -942,7 +1035,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         if (!have_result) ctx->caller_gave_up = true;
         pthread_mutex_unlock(&ctx->mutex);
 
-        if (have_result) finalize_lock_result(t, freq, locked_result);
+        if (have_result) finalize_lock_result(t, freq, locked_result, delivery);
 
         send_value_reply(fd, name, t->channel);
         return;

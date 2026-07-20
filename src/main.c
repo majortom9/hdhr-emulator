@@ -88,10 +88,12 @@ static void *scan_thread_main(void *arg)
         }
         int ffd;
         if (dvb_scan_tune_and_lock(g_cfg.dvb_adapter[0], g_cfg.dvb_frontend,
-                                    atsc_freq_table[i].frequency_hz, &ffd, NULL, NULL)) {
+                                    atsc_freq_table[i].frequency_hz,
+                                    HDHR_DELIVERY_ATSC_VSB, &ffd, NULL, NULL)) {
             total += dvb_scan_read_psip(g_cfg.dvb_adapter[0], g_cfg.dvb_demux,
                                          atsc_freq_table[i].channel,
-                                         atsc_freq_table[i].frequency_hz, ffd);
+                                         atsc_freq_table[i].frequency_hz,
+                                         HDHR_DELIVERY_ATSC_VSB, ffd);
         }
         tuner_release(&g_tuners[0]);
     }

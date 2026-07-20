@@ -48,13 +48,15 @@ static bool read_pmt(int adapter, int demux_num, uint16_t pmt_pid, struct pmt_in
     return psip_parse_pmt(buf, (size_t)n, out) >= 0;
 }
 
-/* Reads TVCT sections until every section_number 0..last_section_number
- * has been seen (typically just one section — a TVCT rarely needs to
- * span multiple sections in practice, but the spec allows it), or a
- * handful of read attempts pass without progress. */
-static int read_tvct(int adapter, int demux_num, struct tvct_entry *out, int max_out)
+/* Reads TVCT/CVCT sections until every section_number 0..last_section_number
+ * has been seen (typically just one section — a TVCT/CVCT rarely needs
+ * to span multiple sections in practice, but the spec allows it), or a
+ * handful of read attempts pass without progress. table_id is 0xC8 for
+ * TVCT (terrestrial) or 0xC9 for CVCT (cable) — psip_parse_tvct() parses
+ * both identically, they share the same wire format per ATSC A/65. */
+static int read_vct(int adapter, int demux_num, uint8_t table_id, struct tvct_entry *out, int max_out)
 {
-    int fd = mpeg_section_filter_open(adapter, demux_num, PSIP_BASE_PID, 0xC8, SECTION_READ_TIMEOUT_MS);
+    int fd = mpeg_section_filter_open(adapter, demux_num, PSIP_BASE_PID, table_id, SECTION_READ_TIMEOUT_MS);
     if (fd < 0) return -1;
 
     bool seen[256] = {false};
@@ -92,7 +94,8 @@ static int read_tvct(int adapter, int demux_num, struct tvct_entry *out, int max
     return total;
 }
 
-bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *out_ffd,
+bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz,
+                             enum hdhr_delivery_system delivery, int *out_ffd,
                              dvb_frontend_progress_cb progress_cb, void *progress_ctx)
 {
     *out_ffd = -1;
@@ -100,7 +103,10 @@ bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *ou
     int ffd = dvb_frontend_open(adapter, frontend);
     if (ffd < 0) return false;
 
-    if (dvb_frontend_tune_8vsb(ffd, freq_hz) != 0) {
+    int tune_rc = (delivery == HDHR_DELIVERY_QAM)
+                  ? dvb_frontend_tune_qam(ffd, freq_hz)
+                  : dvb_frontend_tune_8vsb(ffd, freq_hz);
+    if (tune_rc != 0) {
         dvb_frontend_close(ffd);
         return false;
     }
@@ -113,9 +119,62 @@ bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz, int *ou
     return true;
 }
 
-int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq_hz, int ffd)
+/* Fallback for HDHR_DELIVERY_QAM muxes with no usable CVCT: exposes
+ * every PAT program that resolved a PMT directly, as major=rf_channel,
+ * minor=program_number (e.g. "24.3") — real cable operators
+ * inconsistently carry CVCT at all, and dropping the whole mux just
+ * because PSIP isn't there would throw away real, playable programs.
+ * UNTESTED against real cable signal. */
+static int add_channels_without_vct(int rf_channel, uint32_t freq_hz,
+                                     const struct pat_entry *pat, int pat_count,
+                                     const struct pmt_cache_entry *pmt_cache, int pmt_cache_count)
 {
-    fprintf(stderr, "dvb_scan: locked %u Hz, reading PAT/PMT/TVCT...\n", freq_hz);
+    int added = 0;
+    for (int i = 0; i < pmt_cache_count; i++) {
+        struct dvb_channel ch;
+        memset(&ch, 0, sizeof(ch));
+        ch.major = rf_channel;
+        ch.minor = (int)pmt_cache[i].program_number;
+        ch.rf_channel = rf_channel;
+        ch.delivery = HDHR_DELIVERY_QAM; /* this fallback only ever runs for QAM muxes */
+        snprintf(ch.short_name, sizeof(ch.short_name), "%u-%u", rf_channel, pmt_cache[i].program_number);
+        ch.frequency_hz = freq_hz;
+        ch.program_number = pmt_cache[i].program_number;
+        ch.pcr_pid = pmt_cache[i].pmt.pcr_pid;
+
+        uint16_t vpid, apid;
+        uint8_t vtype, atype;
+        psip_pmt_pick_av(&pmt_cache[i].pmt, &vpid, &vtype, &apid, &atype);
+        ch.video_pid = vpid;
+        ch.video_stream_type = vtype;
+        ch.audio_pid = apid;
+        ch.audio_stream_type = atype;
+
+        for (int k = 0; k < pat_count; k++) {
+            if (pat[k].program_number == pmt_cache[i].program_number) {
+                ch.pmt_pid = pat[k].pmt_pid;
+                break;
+            }
+        }
+
+        if (dvb_channel_db_add(&ch)) {
+            added++;
+            fprintf(stderr, "dvb_scan: found %d.%d (no CVCT, raw program number) video pid "
+                             "0x%04X, audio pid 0x%04X\n",
+                             ch.major, ch.minor, ch.video_pid, ch.audio_pid);
+        } else {
+            fprintf(stderr, "dvb_scan: channel table full (DVB_CHANNEL_MAX), dropping %d.%d\n",
+                             ch.major, ch.minor);
+        }
+    }
+    return added;
+}
+
+int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq_hz,
+                        enum hdhr_delivery_system delivery, int ffd)
+{
+    fprintf(stderr, "dvb_scan: locked %u Hz, reading PAT/PMT/%s...\n", freq_hz,
+            delivery == HDHR_DELIVERY_QAM ? "CVCT" : "TVCT");
 
     struct pat_entry pat[PAT_MAX_ENTRIES];
     int pat_count = read_pat(adapter, demux_num, pat, PAT_MAX_ENTRIES);
@@ -136,15 +195,22 @@ int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq
         }
     }
 
+    uint8_t vct_table_id = (delivery == HDHR_DELIVERY_QAM) ? 0xC9 : 0xC8;
     struct tvct_entry tvct[TVCT_MAX_CHANNELS];
-    int tvct_count = read_tvct(adapter, demux_num, tvct, TVCT_MAX_CHANNELS);
+    int tvct_count = read_vct(adapter, demux_num, vct_table_id, tvct, TVCT_MAX_CHANNELS);
 
     dvb_frontend_close(ffd);
 
     if (tvct_count <= 0) {
-        fprintf(stderr, "dvb_scan: %u Hz: PAT ok (%d programs) but no TVCT — "
+        if (delivery == HDHR_DELIVERY_QAM && pmt_cache_count > 0) {
+            fprintf(stderr, "dvb_scan: %u Hz: PAT ok (%d programs) but no CVCT — "
+                             "falling back to raw program numbers\n", freq_hz, pat_count);
+            return add_channels_without_vct(rf_channel, freq_hz, pat, pat_count,
+                                             pmt_cache, pmt_cache_count);
+        }
+        fprintf(stderr, "dvb_scan: %u Hz: PAT ok (%d programs) but no %s — "
                          "non-ATSC mux or PSIP not on the expected PID, skipping\n",
-                         freq_hz, pat_count);
+                         freq_hz, pat_count, delivery == HDHR_DELIVERY_QAM ? "CVCT" : "TVCT");
         return 0;
     }
 
@@ -180,6 +246,7 @@ int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq
         ch.major = tvct[i].major_channel_number;
         ch.minor = tvct[i].minor_channel_number;
         ch.rf_channel = rf_channel;
+        ch.delivery = delivery;
         snprintf(ch.short_name, sizeof(ch.short_name), "%.15s", tvct[i].short_name);
         ch.frequency_hz = freq_hz;
         ch.channel_tsid = tvct[i].channel_tsid;
@@ -230,9 +297,11 @@ int dvb_scan_run(int adapter, int frontend, int demux_num)
     int total = 0;
     for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
         int ffd;
-        if (dvb_scan_tune_and_lock(adapter, frontend, atsc_freq_table[i].frequency_hz, &ffd, NULL, NULL)) {
+        if (dvb_scan_tune_and_lock(adapter, frontend, atsc_freq_table[i].frequency_hz,
+                                    HDHR_DELIVERY_ATSC_VSB, &ffd, NULL, NULL)) {
             total += dvb_scan_read_psip(adapter, demux_num, atsc_freq_table[i].channel,
-                                         atsc_freq_table[i].frequency_hz, ffd);
+                                         atsc_freq_table[i].frequency_hz,
+                                         HDHR_DELIVERY_ATSC_VSB, ffd);
         }
     }
 

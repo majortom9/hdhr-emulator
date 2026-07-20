@@ -184,7 +184,14 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
     s->frontend_fd = dvb_frontend_open(adapter, frontend);
     if (s->frontend_fd < 0) { free(s); return NULL; }
 
-    if (dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz) != 0) {
+    /* channel->delivery (stamped at scan time — see dvb_scan.c) tells us
+     * which tune function this mux actually needs; a stream open only
+     * gets the dvb_channel pointer, not whatever channelmap was active
+     * when it was originally scanned. */
+    int tune_rc = (channel->delivery == HDHR_DELIVERY_QAM)
+                  ? dvb_frontend_tune_qam(s->frontend_fd, channel->frequency_hz)
+                  : dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz);
+    if (tune_rc != 0) {
         dvb_frontend_close(s->frontend_fd);
         free(s);
         return NULL;

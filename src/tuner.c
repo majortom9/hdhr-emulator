@@ -13,6 +13,7 @@ void tuner_pool_init(struct hdhr_tuner *tuners, int count, const struct hdhr_con
         pthread_mutex_init(&tuners[i].lock, NULL);
         pthread_cond_init(&tuners[i].free_cond, NULL);
         snprintf(tuners[i].channel, sizeof(tuners[i].channel), "none");
+        snprintf(tuners[i].channelmap, sizeof(tuners[i].channelmap), "us-bcast");
         tuners[i].program = -1; /* DVB_PROGRAM_DEFAULT sentinel — see dvb_stream.h */
         snprintf(tuners[i].target, sizeof(tuners[i].target), "none");
         snprintf(tuners[i].status, sizeof(tuners[i].status), "state=idle");
