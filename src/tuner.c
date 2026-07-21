@@ -18,7 +18,19 @@ void tuner_pool_init(struct hdhr_tuner *tuners, int count, const struct hdhr_con
         snprintf(tuners[i].channelmap, sizeof(tuners[i].channelmap), "us-bcast");
         tuners[i].program = -1; /* DVB_PROGRAM_DEFAULT sentinel — see dvb_stream.h */
         snprintf(tuners[i].target, sizeof(tuners[i].target), "none");
-        snprintf(tuners[i].status, sizeof(tuners[i].status), "state=idle");
+        /* Matches a genuine HDHomeRun3's own idle /tunerN/status verbatim
+         * (confirmed live, 2026-07-20: "ch=none lock=none ss=0 snq=0
+         * seq=0 bps=0 pps=0" on an unselected tuner) — not just
+         * cosmetic: libhdhomerun's hdhomerun_device_get_tuner_status()
+         * parses status->channel out of this string's "ch=" token and
+         * leaves it as an empty string if "ch=" is absent (status is
+         * memset to 0 first, and there's no separate fallback), so a
+         * placeholder without "ch=" at all (this used to be the bare
+         * "state=idle") made hdhomerun_config_gui's "Physical Channel"
+         * field show blank instead of "none" once a channel was
+         * deselected. */
+        snprintf(tuners[i].status, sizeof(tuners[i].status),
+                 "ch=none lock=none ss=0 snq=0 seq=0 bps=0 pps=0");
     }
 }
 

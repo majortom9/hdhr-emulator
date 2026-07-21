@@ -880,7 +880,11 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         t->tuned_frequency_hz = 0;
         t->vch_resolved = false;
         t->filter_override[0] = '\0';
-        snprintf(t->status, sizeof(t->status), "state=idle");
+        /* "ch=none lock=none ss=0 snq=0 seq=0 bps=0 pps=0" — matches a
+         * genuine HDHomeRun3's own idle status verbatim (see
+         * tuner_pool_init()'s comment for why the "ch=" token
+         * specifically matters, not just cosmetics). */
+        snprintf(t->status, sizeof(t->status), "ch=none lock=none ss=0 snq=0 seq=0 bps=0 pps=0");
         tuner_unlock(t);
         send_value_reply(fd, name, value);
         return;
@@ -931,7 +935,10 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             t->tuned_frequency_hz = 0;
             t->vch_resolved = false;
             t->filter_override[0] = '\0';
-            snprintf(t->status, sizeof(t->status), "state=idle");
+            /* Matches a genuine HDHomeRun3's own idle status verbatim —
+             * see tuner_pool_init()'s comment for why the "ch=" token
+             * specifically matters, not just cosmetics. */
+            snprintf(t->status, sizeof(t->status), "ch=none lock=none ss=0 snq=0 seq=0 bps=0 pps=0");
             tuner_unlock(t);
             send_value_reply(fd, name, "none");
             return;
