@@ -119,8 +119,40 @@ struct hdhr_tuner {
      * own this the way active streaming does (see dvb_stream.c's own
      * copy of this same state), so it lives here instead. Reset
      * (zeroed) every time a new hold is opened, so a previous
-     * channel's counts never leak into a new one's window. */
+     * channel's counts never leak into a new one's window. Exclusively
+     * read/written by held_stats_thread_main() (see held_stats_thread
+     * below) -- NOT guarded by `lock`, since only that one background
+     * thread ever touches it. */
     struct dvb_legacy_seq_state held_legacy_seq;
+
+    /* Background refresher for held_fd's own live signal stats --
+     * confirmed live (2026-07-20) that dvb_frontend_read_stats() can
+     * itself block for multiple seconds on this hardware under marginal
+     * conditions (same driver-level risk already documented for tuning,
+     * see dvb_frontend.c's PROGRESS_CB_INTERVAL_MS comment, just not
+     * previously known to affect plain stat reads on an *already*-tuned
+     * fd too -- one observed instance took 6.8 real seconds). Calling
+     * that directly from a connection thread answering a /tunerN/status
+     * GET risked exceeding a real client's own patience and produced a
+     * genuine "communication error". held_stats_thread_main() now owns
+     * all reads of held_fd's stats, refreshing held_stats_cache
+     * periodically on its own thread; /tunerN/status only ever reads
+     * the cache, never calling the ioctl itself. Started by
+     * tuner_open_hold() once held_fd is set; stopped (and joined -- see
+     * stop_held_stats_thread() in tuner.c) before held_fd is ever
+     * closed or handed off, by every call site that does so
+     * (tuner_close_hold(), tuner_try_claim()/tuner_try_claim_wait()'s
+     * resolve_claimed_hold()). The thread never closes held_fd itself --
+     * ownership of the fd's lifecycle stays exactly where it already
+     * was; this only adds a cache in front of reading it. Guarded by
+     * `lock`, like every other field here, except held_stats_thread
+     * itself (only ever touched by whichever code currently owns
+     * starting/joining it, never concurrently). */
+    pthread_t held_stats_thread;
+    bool      held_stats_thread_started;
+    volatile bool held_stats_stop_requested;
+    struct dvb_signal_stats held_stats_cache;
+    bool      held_stats_cache_valid;
 
     /* Live signal stats published by an in-flight /tunerN/channel scan
      * (control.c's channel_scan_thread_main, via
@@ -253,6 +285,42 @@ bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
  * want_freq_hz/want_delivery/out_reused_fd reuse behavior). */
 bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_freq_hz,
                            enum hdhr_delivery_system want_delivery, int *out_reused_fd);
+
+/* Like tuner_try_claim(), but does NOT resolve an existing hold itself --
+ * hands back whatever held_fd was open (or -1) via *out_stale_held_fd,
+ * already atomically detached from the tuner (t->held_fd is cleared
+ * before this returns, so any concurrent /tunerN/status GET immediately
+ * stops seeing it), but not yet stopped/closed. The caller must pass it
+ * to tuner_resolve_stale_held_fd() *on its own background thread*, not
+ * inline here.
+ *
+ * Why this exists at all: resolving a stale hold (tuner_try_claim()'s
+ * normal behavior) means stop_held_stats_thread() joining held_fd's
+ * background refresher, which can itself block for as long as that
+ * thread's current stat-read takes -- confirmed live to occasionally
+ * reach several seconds on this hardware. tuner_try_claim() accepts that
+ * cost because its callers (udp_stream.c's push thread, http_server.c's
+ * per-connection thread) already run on their own background thread, so
+ * blocking there doesn't threaten any reply's timing. control.c's raw
+ * /tunerN/channel SET is different: it must claim synchronously, on the
+ * connection thread, specifically to decide fast/queued/refused for its
+ * own reply (see its own comment) -- so THAT resolution can't happen
+ * inline either, or the exact problem this whole file is designed
+ * around (a client's own reply patience) reappears one level up.
+ * Confirmed live, 2026-07-20: leaving the old synchronous
+ * tuner_close_hold() call in front of tuner_try_claim() produced a real
+ * "communication error" on the very first channel of a scan, when a
+ * stale hold's refresher happened to be mid-slow-read at that moment. */
+bool tuner_try_claim_fast(struct hdhr_tuner *t, int *out_stale_held_fd);
+
+/* Finishes what tuner_try_claim_fast() deferred: stops (joins) the
+ * stale held fd's background stats refresher if one was running, then
+ * closes the fd. Safe to call with stale_held_fd < 0 (no-op). Meant to
+ * be called from the caller's OWN background thread (e.g.
+ * channel_scan_thread_main, as its very first action) -- calling this
+ * synchronously on a connection thread defeats the entire point of
+ * deferring it via tuner_try_claim_fast() in the first place. */
+void tuner_resolve_stale_held_fd(struct hdhr_tuner *t, int stale_held_fd);
 
 /* Records the dvb_stream now backing this (already-claimed) tuner, so
  * other code (e.g. status/streaminfo reporting) can see it. */

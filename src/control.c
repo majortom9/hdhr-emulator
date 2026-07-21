@@ -475,30 +475,37 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                      bps, pps);
         } else if (t->held_fd >= 0) {
             /* No active stream, but this channel is still selected and
-             * held (see held_fd's own comment / tuner_open_hold()) --
-             * read genuinely live stats straight from that fd, the
-             * same way the active_stream branch above does, matching
-             * real hardware's continuously-engaged-once-selected
-             * behavior. Unlike the scan_stats branch below, stats.has_lock
-             * is authoritative here (not just a periodic snapshot that
-             * can lag behind t->status), since this is a fresh read on
-             * every single poll. */
-            struct dvb_signal_stats stats;
-            struct timespec t0;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            dvb_frontend_read_stats(t->held_fd, &stats);
-            log_if_slow("dvb_frontend_read_stats (held_fd)", t->index, &t0);
-            if (stats.symbol_quality_pct < 0) {
-                int legacy_pct = dvb_frontend_legacy_seq_pct(t->held_fd, &t->held_legacy_seq, stats.has_lock);
-                if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
+             * held (see held_fd's own comment / tuner_open_hold()),
+             * matching real hardware's continuously-engaged-once-
+             * selected behavior. Reads the cache held_stats_thread_main()
+             * (tuner.c) keeps refreshing on its own background thread,
+             * rather than calling dvb_frontend_read_stats() directly
+             * here -- confirmed live (2026-07-20) that call can itself
+             * block for multiple seconds on this hardware (up to 6.8s
+             * observed) under marginal conditions, which previously
+             * risked exceeding a real client's own patience and
+             * producing a genuine "communication error" on what should
+             * be a cheap, fast status poll. */
+            if (t->held_stats_cache_valid) {
+                struct dvb_signal_stats stats = t->held_stats_cache;
+                snprintf(val, sizeof(val),
+                         "ch=%s lock=%s ss=%d snq=%d seq=%d",
+                         t->channel,
+                         stats.has_lock ? (t->tuned_delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb") : "none",
+                         stats.signal_strength_pct < 0 ? 0 : stats.signal_strength_pct,
+                         stats.snr_quality_pct < 0 ? 0 : stats.snr_quality_pct,
+                         stats.symbol_quality_pct < 0 ? 0 : stats.symbol_quality_pct);
+            } else {
+                /* Hold was only just opened -- the background refresher
+                 * hasn't published its first reading yet. Same "still
+                 * checking, not confirmed no signal" placeholder a
+                 * queued channel-scan request uses below, and for the
+                 * same reason (see that comment): ss=0 here would read
+                 * as signal_present=false to a real client and could
+                 * make it give up immediately instead of waiting a
+                 * moment for a real reading. */
+                snprintf(val, sizeof(val), "ch=%s lock=none ss=45 snq=0 seq=0", t->channel);
             }
-            snprintf(val, sizeof(val),
-                     "ch=%s lock=%s ss=%d snq=%d seq=%d",
-                     t->channel,
-                     stats.has_lock ? (t->tuned_delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb") : "none",
-                     stats.signal_strength_pct < 0 ? 0 : stats.signal_strength_pct,
-                     stats.snr_quality_pct < 0 ? 0 : stats.snr_quality_pct,
-                     stats.symbol_quality_pct < 0 ? 0 : stats.symbol_quality_pct);
         } else if (t->scan_stats_valid && t->scan_stats_freq == t->tuned_frequency_hz) {
             /* No active stream, but a /tunerN/channel scan has published
              * at least one live reading for the frequency we're
@@ -711,6 +718,9 @@ struct channel_scan_ctx {
     int rf_channel;
     uint32_t freq;
     enum hdhr_delivery_system delivery; /* from t->channelmap at SET time — see channel_map.h */
+    int stale_held_fd; /* from tuner_try_claim_fast() -- see channel_scan_thread_main's
+                          * own first action, and tuner_try_claim_fast()'s comment for
+                          * why resolving it can't happen on the connection thread. */
 
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -799,6 +809,14 @@ static void *channel_scan_thread_main(void *arg)
     struct hdhr_tuner *t = ctx->t;
     uint32_t freq = ctx->freq;
     int rf_channel = ctx->rf_channel;
+
+    /* Deferred from tuner_try_claim_fast() -- this can block briefly
+     * (joining a stale hold's background stats refresher, see
+     * tuner_resolve_stale_held_fd()'s comment), which is exactly why
+     * it's done here, on this background thread, rather than on the
+     * connection thread that already replied to the SET that got us
+     * here. */
+    tuner_resolve_stale_held_fd(t, ctx->stale_held_fd);
 
     for (;;) {
         struct scan_progress_ctx pc = { .t = t, .freq = freq };
@@ -991,13 +1009,18 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             return;
         }
 
-        /* Close any hold from a *previous* channel selection before
-         * starting this new tune attempt, so a stale old-channel fd
-         * doesn't linger during it -- /tunerN/status correctly falls
-         * back to scan_stats' live in-progress reporting below until
-         * this attempt's own hold gets opened (see
-         * channel_scan_thread_main). */
-        tuner_close_hold(t);
+        /* Any hold from a *previous* channel selection gets detached
+         * from the tuner (t->held_fd cleared) as part of
+         * tuner_try_claim_fast() below, so /tunerN/status immediately
+         * stops showing it -- but the actual close (which can block
+         * briefly, see tuner_try_claim_fast()'s comment) is deliberately
+         * deferred to channel_scan_thread_main's own first action,
+         * rather than done synchronously right here on the connection
+         * thread. An explicit tuner_close_hold() used to run here
+         * instead; confirmed live (2026-07-20) that produced a real
+         * "communication error" on the very first channel of a scan
+         * whenever a stale hold's background stats refresher happened
+         * to be mid-slow-read at that exact moment. */
 
         /* Real semantics: /tunerN/channel is a raw RF tune, independent
          * of any specific virtual channel/program selection — that
@@ -1040,12 +1063,16 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * update status whenever it's actually done.
          * channel_scan_thread_main() owns releasing the claim taken here
          * once nothing's left queued. */
-        /* Not interested in held-fd reuse here (out_reused_fd NULL) --
-         * this path always does its own fresh tune+PSIP scan via
-         * dvb_scan_tune_and_lock(), never dvb_stream_open(), so there's
-         * nothing to hand an adopted fd to; any existing hold is simply
-         * closed, same as before. */
-        if (!tuner_try_claim(t, 0, HDHR_DELIVERY_ATSC_VSB, NULL)) {
+        /* _fast, not tuner_try_claim() -- this path always does its own
+         * fresh tune+PSIP scan via dvb_scan_tune_and_lock(), never
+         * dvb_stream_open(), so there's no held-fd reuse to want here
+         * either way; but resolving (stopping + closing) any existing
+         * hold still needs to happen off this connection thread -- see
+         * tuner_try_claim_fast()'s own comment. stale_held_fd gets
+         * carried into ctx below and resolved as
+         * channel_scan_thread_main's first action. */
+        int stale_held_fd = -1;
+        if (!tuner_try_claim_fast(t, &stale_held_fd)) {
             tuner_lock(t);
             bool has_active_stream = (t->active_stream != NULL);
             if (!has_active_stream) {
@@ -1086,7 +1113,31 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                 t->filter_override[0] = '\0';
                 snprintf(t->channel, sizeof(t->channel), "%s:%u",
                          delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
-                snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
+                /* ss=45 lock=none, not ss=0 -- this is a placeholder for
+                 * a frequency that's merely queued, not yet actually
+                 * attempted (channel_scan_thread_main hasn't gotten to
+                 * it). A bare "lock=none" with no ss=/snq=/seq= fields
+                 * at all (what this used to say) parses as ss=0 on the
+                 * real client (hdhomerun_device_get_status_parse()
+                 * defaults an absent tag to 0), which reads as
+                 * signal_present=false (ss<45) and makes
+                 * hdhomerun_device_wait_for_lock() give up on its very
+                 * first poll -- confirmed live: a busy scan would then
+                 * race through the entire rest of the band reporting
+                 * fabricated "no lock" results for channels that were
+                 * never actually tuned to at all, since every one of
+                 * them looked instantly "confirmed no signal" the
+                 * moment it was merely queued. 45 is deliberately right
+                 * at signal_present's own threshold -- enough to keep
+                 * wait_for_lock() polling (up to its own ~2.5s budget)
+                 * hoping for a real result instead of bailing
+                 * immediately, without claiming an actual lock. Once
+                 * this thread's own worker genuinely starts on this
+                 * frequency, publish_scan_stats() supersedes this with
+                 * real readings before this placeholder's ever read
+                 * again in practice. */
+                snprintf(t->status, sizeof(t->status),
+                         "ch=%s lock=none ss=45 snq=0 seq=0 bps=0 pps=0", t->channel);
                 tuner_unlock(t);
                 send_value_reply(fd, name, t->channel);
                 return;
@@ -1115,7 +1166,15 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * the exact modulation string against (see channel_map.h). */
         snprintf(t->channel, sizeof(t->channel), "%s:%u",
                  delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
-        snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
+        /* ss=45, not a bare "lock=none" with no ss= at all -- same
+         * placeholder, same reasoning, as the queued-request branch
+         * above: this can now be visible for a few real seconds (while
+         * channel_scan_thread_main resolves a stale hold before it even
+         * starts tuning, see tuner_try_claim_fast()'s comment), and a
+         * bare "lock=none" parses as ss=0 on a real client, which reads
+         * as "confirmed no signal" and can make it give up immediately
+         * instead of waiting for a genuine result. */
+        snprintf(t->status, sizeof(t->status), "ch=%s lock=none ss=45 snq=0 seq=0", t->channel);
         tuner_unlock(t);
 
         struct channel_scan_ctx *ctx = malloc(sizeof(*ctx));
@@ -1124,6 +1183,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         ctx->rf_channel = rf_channel;
         ctx->freq = freq;
         ctx->delivery = delivery;
+        ctx->stale_held_fd = stale_held_fd;
         pthread_mutex_init(&ctx->mutex, NULL);
         pthread_cond_init(&ctx->cond, NULL);
         ctx->lock_known = false;
@@ -1135,6 +1195,11 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             fprintf(stderr, "control: tuner%d/channel: failed to start scan thread\n", t->index);
             pthread_mutex_destroy(&ctx->mutex);
             pthread_cond_destroy(&ctx->cond);
+            /* channel_scan_thread_main never runs to do this itself --
+             * resolve it here instead so a stale hold's fd/thread don't
+             * leak. Blocking here is acceptable: this is the rare
+             * pthread_create()-failed path, not the normal one. */
+            tuner_resolve_stale_held_fd(t, stale_held_fd);
             free(ctx);
             tuner_release(t); /* don't leave the tuner claimed forever if we can't scan */
             send_value_reply(fd, name, t->channel);

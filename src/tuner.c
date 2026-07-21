@@ -3,6 +3,7 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <unistd.h>
 
 void tuner_pool_init(struct hdhr_tuner *tuners, int count, const struct hdhr_config *cfg)
 {
@@ -37,6 +38,82 @@ void tuner_pool_init(struct hdhr_tuner *tuners, int count, const struct hdhr_con
 void tuner_lock(struct hdhr_tuner *t)   { pthread_mutex_lock(&t->lock); }
 void tuner_unlock(struct hdhr_tuner *t) { pthread_mutex_unlock(&t->lock); }
 
+/* How often held_stats_thread_main() refreshes held_fd's cached stats.
+ * See tuner.h's held_stats_thread comment for why this exists at all --
+ * short enough that /tunerN/status still looks live, comfortably longer
+ * than even the worst confirmed-live stat-read stall (6.8s) so this
+ * thread's own loop can't itself be a source of runaway ioctl spam. */
+#define HELD_STATS_REFRESH_MS 500
+
+/* Owns every read of held_fd's live signal stats -- see tuner.h's
+ * held_stats_thread comment. Runs until told to stop (held_fd is
+ * reassigned/cleared elsewhere, or held_stats_stop_requested is set) --
+ * checked only *between* iterations, since dvb_frontend_read_stats()
+ * itself can't be interrupted once it's blocked inside a kernel ioctl
+ * on this hardware. Never closes fd itself; that stays the exact
+ * responsibility it already was (tuner_close_hold(),
+ * resolve_claimed_hold()) -- this thread purely caches. */
+static void *held_stats_thread_main(void *arg)
+{
+    struct hdhr_tuner *t = arg;
+
+    tuner_lock(t);
+    int fd = t->held_fd;
+    tuner_unlock(t);
+
+    while (fd >= 0) {
+        struct dvb_signal_stats stats;
+        dvb_frontend_read_stats(fd, &stats); /* the call this whole thread
+            * exists to keep off any connection thread -- confirmed live
+            * to occasionally block for multiple seconds on this
+            * hardware (up to 6.8s observed) under marginal conditions. */
+        if (stats.symbol_quality_pct < 0) {
+            int legacy = dvb_frontend_legacy_seq_pct(fd, &t->held_legacy_seq, stats.has_lock);
+            if (legacy >= 0) stats.symbol_quality_pct = legacy;
+        }
+
+        tuner_lock(t);
+        if (t->held_stats_stop_requested || t->held_fd != fd) {
+            tuner_unlock(t);
+            break;
+        }
+        t->held_stats_cache = stats;
+        t->held_stats_cache_valid = true;
+        tuner_unlock(t);
+
+        usleep(HELD_STATS_REFRESH_MS * 1000);
+
+        tuner_lock(t);
+        bool stop = (t->held_stats_stop_requested || t->held_fd != fd);
+        tuner_unlock(t);
+        if (stop) break;
+    }
+    return NULL;
+}
+
+/* Must be called before held_fd is ever closed or handed off elsewhere
+ * (tuner_close_hold(), resolve_claimed_hold()) -- guarantees
+ * held_stats_thread_main() is no longer touching the fd. Can block
+ * briefly (up to however long that thread's current, possibly slow,
+ * stat-read takes -- see held_stats_thread_main) but only ever runs at
+ * claim/hold-transition points, never on the /tunerN/status GET path
+ * itself, which is the entire point of this mechanism. Safe to call
+ * with no thread running. */
+static void stop_held_stats_thread(struct hdhr_tuner *t)
+{
+    tuner_lock(t);
+    bool started = t->held_stats_thread_started;
+    t->held_stats_stop_requested = true;
+    tuner_unlock(t);
+
+    if (!started) return;
+    pthread_join(t->held_stats_thread, NULL);
+
+    tuner_lock(t);
+    t->held_stats_thread_started = false;
+    tuner_unlock(t);
+}
+
 /* Shared by tuner_try_claim()/tuner_try_claim_wait() once busy has been
  * claimed and held_fd/tuned_frequency_hz/tuned_delivery captured under
  * the lock — resolves the captured held fd against the caller's wanted
@@ -46,20 +123,29 @@ void tuner_unlock(struct hdhr_tuner *t) { pthread_mutex_unlock(&t->lock); }
  * (rather than reading t-> directly) since it runs outside the lock
  * (dvb_frontend_close() can block) and those fields aren't otherwise
  * guaranteed stable once busy is claimed. */
-static void resolve_claimed_hold(int held, uint32_t tuned_freq_hz,
+static void resolve_claimed_hold(struct hdhr_tuner *t, int held, uint32_t tuned_freq_hz,
                                    enum hdhr_delivery_system tuned_delivery,
                                    uint32_t want_freq_hz, enum hdhr_delivery_system want_delivery,
                                    int *out_reused_fd)
 {
-    bool reuse = (held >= 0 && out_reused_fd &&
+    if (held < 0) {
+        if (out_reused_fd) *out_reused_fd = -1;
+        return;
+    }
+
+    /* Must happen before this fd is closed OR handed off for reuse --
+     * see stop_held_stats_thread()'s own comment. */
+    stop_held_stats_thread(t);
+
+    bool reuse = (out_reused_fd &&
                   tuned_freq_hz == want_freq_hz && tuned_delivery == want_delivery);
     if (reuse) {
         *out_reused_fd = held;
         return;
     }
     if (out_reused_fd) *out_reused_fd = -1;
-    if (held >= 0) dvb_frontend_close(held); /* see held_fd's own comment: never
-                                                * concurrent with an active_stream's fd */
+    dvb_frontend_close(held); /* see held_fd's own comment: never
+                                * concurrent with an active_stream's fd */
 }
 
 bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
@@ -77,8 +163,29 @@ bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
     enum hdhr_delivery_system tuned_delivery = t->tuned_delivery;
     tuner_unlock(t);
 
-    resolve_claimed_hold(held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
+    resolve_claimed_hold(t, held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
     return true;
+}
+
+bool tuner_try_claim_fast(struct hdhr_tuner *t, int *out_stale_held_fd)
+{
+    tuner_lock(t);
+    if (t->busy) {
+        tuner_unlock(t);
+        return false;
+    }
+    t->busy = true;
+    *out_stale_held_fd = t->held_fd;
+    t->held_fd = -1;
+    tuner_unlock(t);
+    return true;
+}
+
+void tuner_resolve_stale_held_fd(struct hdhr_tuner *t, int stale_held_fd)
+{
+    if (stale_held_fd < 0) return;
+    stop_held_stats_thread(t);
+    dvb_frontend_close(stale_held_fd);
 }
 
 bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_freq_hz,
@@ -112,7 +219,7 @@ bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_fr
     enum hdhr_delivery_system tuned_delivery = t->tuned_delivery;
     tuner_unlock(t);
 
-    resolve_claimed_hold(held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
+    resolve_claimed_hold(t, held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
     return true;
 }
 
@@ -164,7 +271,10 @@ void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_
     int old_held = t->held_fd;
     t->held_fd = -1;
     tuner_unlock(t);
-    if (old_held >= 0) dvb_frontend_close(old_held);
+    if (old_held >= 0) {
+        stop_held_stats_thread(t); /* must finish before old_held is closed */
+        dvb_frontend_close(old_held);
+    }
 
     int fd = dvb_frontend_open(t->adapter, t->frontend);
     if (fd < 0) return;
@@ -187,6 +297,22 @@ void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_
     }
     t->held_fd = fd;
     t->held_legacy_seq = (struct dvb_legacy_seq_state){0};
+    t->held_stats_cache_valid = false;
+    t->held_stats_stop_requested = false;
+    /* Whole publish-and-start sequence happens under this one lock hold
+     * so a concurrent stop_held_stats_thread() call can never observe a
+     * torn state (held_fd set but held_stats_thread_started still
+     * false, or vice versa) -- the new thread's own first action is to
+     * take this same lock, so it simply waits for us to unlock below
+     * rather than racing. */
+    if (pthread_create(&t->held_stats_thread, NULL, held_stats_thread_main, t) == 0) {
+        t->held_stats_thread_started = true;
+    } else {
+        fprintf(stderr, "tuner%d: failed to start held-stats refresher thread -- "
+                         "/tunerN/status will show a placeholder instead of live "
+                         "stats for this hold\n", t->index);
+        t->held_stats_thread_started = false;
+    }
     tuner_unlock(t);
 }
 
@@ -196,7 +322,9 @@ void tuner_close_hold(struct hdhr_tuner *t)
     int fd = t->held_fd;
     t->held_fd = -1;
     tuner_unlock(t);
-    if (fd >= 0) dvb_frontend_close(fd);
+    if (fd < 0) return;
+    stop_held_stats_thread(t); /* must finish before fd is closed */
+    dvb_frontend_close(fd);
 }
 
 struct hdhr_tuner *tuner_pool_claim_free(struct hdhr_tuner *tuners, int count,
