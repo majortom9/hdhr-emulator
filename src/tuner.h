@@ -31,6 +31,12 @@
 struct hdhr_tuner {
     int      index;
     int      adapter; /* physical /dev/dvb/adapterN, from config */
+    int      frontend; /* frontend index within that adapter, from config
+                          * (cfg->dvb_frontend, same value for every tuner
+                          * slot) -- copied here so tuner_open_hold()/
+                          * tuner_release() can self-sufficiently re-tune
+                          * without needing cfg threaded through every
+                          * call site. */
     pthread_mutex_t lock;
     pthread_cond_t  free_cond; /* signaled by tuner_release(); see tuner_try_claim_wait() */
 
@@ -71,8 +77,50 @@ struct hdhr_tuner {
                                    * Drives /tunerN/streaminfo's live per-mux program
                                    * listing independent of whether anything is
                                    * actively streaming — see control.c. */
+    enum hdhr_delivery_system tuned_delivery; /* which modulation tuned_frequency_hz
+                                   * needs (8VSB vs QAM) -- set alongside
+                                   * tuned_frequency_hz (tuner_bind_channel(), and
+                                   * control.c's raw /tunerN/channel SET), read back
+                                   * by tuner_release() to know how to re-tune when
+                                   * re-establishing a hold (see held_fd below). */
 
     char     status[160];
+
+    /* Background "hold": a frontend fd kept open+tuned to
+     * tuned_frequency_hz/tuned_delivery for as long as a channel is
+     * selected, independent of whether anything is actively streaming
+     * it -- -1 when not held. Real HDHomeRun firmware engages a
+     * selected tuner's physical frontend continuously and keeps
+     * reporting genuinely live signal stats regardless of whether a
+     * client is pulling video; without this, this project's own lazy
+     * "only tune when actually streaming" design (see tuner_bind_channel()'s
+     * comment) meant /tunerN/status went stale the instant a channel
+     * scan/verify finished, showing a frozen one-time snapshot
+     * (`scan_stats` below) for as long as a channel was merely
+     * selected but not being watched -- confirmed live, and a real
+     * problem for third-party signal-monitoring tools that poll
+     * channel+status without ever actually streaming.
+     *
+     * Opened by tuner_open_hold() (control.c's vchannel SET, and
+     * channel_scan_thread_main once its own scan/verify tune
+     * completes); closed by tuner_close_hold() (an explicit
+     * channel=none or channelmap change) or automatically by
+     * tuner_try_claim()/tuner_try_claim_wait() the instant something
+     * wants to actually stream this tuner (a held fd and an
+     * active_stream's own fd must never be open on the same physical
+     * frontend device node at once). tuner_release() re-opens a fresh
+     * hold once streaming ends, if a channel is still logically
+     * selected -- so live status resumes automatically once playback
+     * stops, matching real hardware. Guarded by `lock`. */
+    int      held_fd;
+    /* Windowed state for the legacy FE_READ_UNCORRECTED_BLOCKS-based
+     * seq= fallback (see dvb_frontend_legacy_seq_pct()) while reading
+     * held_fd specifically -- a held tune has no struct dvb_stream to
+     * own this the way active streaming does (see dvb_stream.c's own
+     * copy of this same state), so it lives here instead. Reset
+     * (zeroed) every time a new hold is opened, so a previous
+     * channel's counts never leak into a new one's window. */
+    struct dvb_legacy_seq_state held_legacy_seq;
 
     /* Live signal stats published by an in-flight /tunerN/channel scan
      * (control.c's channel_scan_thread_main, via
@@ -175,7 +223,10 @@ void tuner_unlock(struct hdhr_tuner *t);
  * must then either try a different tuner (HTTP auto-allocation) or
  * report "tuner busy" (an explicit /tunerN/... request). On success the
  * caller owns the tuner until tuner_release(); it's expected to open a
- * dvb_stream and store it via tuner_set_stream(). */
+ * dvb_stream and store it via tuner_set_stream(). Also closes this
+ * tuner's background hold (see held_fd/tuner_open_hold()) if one is
+ * open, since a hold and an active_stream's own frontend fd must never
+ * both be open on the same physical frontend device node at once. */
 bool tuner_try_claim(struct hdhr_tuner *t);
 
 /* Like tuner_try_claim(), but if the tuner is already busy, waits up to
@@ -185,7 +236,8 @@ bool tuner_try_claim(struct hdhr_tuner *t);
  * scan's next frequency, right behind the previous one's) rather than
  * ones that should fail fast if the tuner isn't immediately available
  * (e.g. a live stream request, which still wants tuner_try_claim()).
- * Returns false if still busy after the timeout. */
+ * Returns false if still busy after the timeout. Closes an existing
+ * hold on success, same as tuner_try_claim(). */
 bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms);
 
 /* Records the dvb_stream now backing this (already-claimed) tuner, so
@@ -193,7 +245,14 @@ bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms);
 void tuner_set_stream(struct hdhr_tuner *t, struct dvb_stream *s);
 
 /* Closes any active stream (safe to call with none active) and marks
- * the tuner idle again. */
+ * the tuner idle again. If a channel is still logically selected
+ * (tuned_frequency_hz != 0 -- i.e. wasn't cleared to "none" during the
+ * stream) and nothing already re-established one in the meantime,
+ * re-opens a background hold (see held_fd/tuner_open_hold()) so
+ * /tunerN/status resumes reporting live stats immediately once
+ * streaming ends, rather than going stale until the next explicit
+ * channel/vchannel SET -- matching real hardware, which never stops
+ * engaging a selected tuner's frontend just because a viewer left. */
 void tuner_release(struct hdhr_tuner *t);
 
 /* Records which virtual channel + effective program an active stream is
@@ -205,6 +264,24 @@ void tuner_release(struct hdhr_tuner *t);
  * streaming. Call after a successful tuner_try_claim()+dvb_stream_open(),
  * before tuner_set_stream(). */
 void tuner_bind_channel(struct hdhr_tuner *t, const struct dvb_channel *ch, int program_override);
+
+/* Opens+tunes (non-blocking -- does not wait for lock) a background
+ * "hold" frontend for freq_hz/delivery, closing any previous hold on
+ * this tuner first, so /tunerN/status can report genuinely live
+ * signal stats for a selected channel even when nothing is actively
+ * streaming it -- matching real hardware's continuously-engaged-once-
+ * selected behavior. See held_fd's own comment in tuner.h.
+ *
+ * Does nothing (silently) if this tuner currently has an active_stream
+ * -- that stream's own frontend fd already serves live status (see
+ * control.c's /tunerN/status handler), and opening a second fd on the
+ * same physical frontend device node here would conflict with it. */
+void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_system delivery);
+
+/* Closes any open hold without opening a new one -- e.g. an explicit
+ * /tunerN/channel=none SET or a channelmap change. Safe to call with
+ * no hold open. */
+void tuner_close_hold(struct hdhr_tuner *t);
 
 /* Scans for the first idle tuner and claims it. Returns NULL if all
  * tuners are currently busy. Used by HTTP's channel-only /auto/vX.X

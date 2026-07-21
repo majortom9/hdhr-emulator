@@ -56,14 +56,24 @@
  *                      the comment at the SET handler's channel branch.
  *                      Does not select a specific virtual
  *                      channel/program by itself.
- *   /tunerN/channelmap GET-only, always "us-bcast" (8VSB/US-OTA only,
- *                      per project scope — SET is rejected)
+ *   /tunerN/channelmap us-bcast (default), or one of the UNTESTED cable/
+ *                      Korean maps (us-cable/us-hrc/us-irc/kr-bcast/
+ *                      kr-cable — see channel_map.h). Changing it clears
+ *                      any tuned channel/vchannel state, since a channel
+ *                      *number* means something different in every map.
  *   /tunerN/vchannel   set "<major>.<minor>" to select a channel found by
  *                      the ATSC scan (dvb_scan.c) — resolves major.minor
  *                      to a frequency + program number in our own
- *                      channel database, real RF tuning happens lazily
- *                      when a stream is actually opened (target= or an
- *                      HTTP pull), not at vchannel-set time, since only
+ *                      channel database, and immediately opens a
+ *                      background "hold" tune (tuner_open_hold(), see
+ *                      ARCHITECTURE.md §16) so /tunerN/status reports
+ *                      genuinely live signal stats even before anything
+ *                      actually streams it — matching real firmware,
+ *                      which engages a selected tuner's frontend
+ *                      continuously regardless of whether a client is
+ *                      pulling video. The demux/PID-filtered capture
+ *                      itself still only opens once a stream is actually
+ *                      requested (target= or an HTTP pull), since only
  *                      one physical tuner lock can be held at once (see
  *                      tuner.h's claim/release model).
  *   /tunerN/program    MPEG program number filter — 0 for full-mux
@@ -433,6 +443,29 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                      stats.snr_quality_pct < 0 ? 1 : stats.snr_quality_pct,
                      stats.symbol_quality_pct < 0 ? 1 : stats.symbol_quality_pct,
                      bps, pps);
+        } else if (t->held_fd >= 0) {
+            /* No active stream, but this channel is still selected and
+             * held (see held_fd's own comment / tuner_open_hold()) --
+             * read genuinely live stats straight from that fd, the
+             * same way the active_stream branch above does, matching
+             * real hardware's continuously-engaged-once-selected
+             * behavior. Unlike the scan_stats branch below, stats.has_lock
+             * is authoritative here (not just a periodic snapshot that
+             * can lag behind t->status), since this is a fresh read on
+             * every single poll. */
+            struct dvb_signal_stats stats;
+            dvb_frontend_read_stats(t->held_fd, &stats);
+            if (stats.symbol_quality_pct < 0) {
+                int legacy_pct = dvb_frontend_legacy_seq_pct(t->held_fd, &t->held_legacy_seq);
+                if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
+            }
+            snprintf(val, sizeof(val),
+                     "ch=%s lock=%s ss=%d snq=%d seq=%d",
+                     t->channel,
+                     stats.has_lock ? (t->tuned_delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb") : "none",
+                     stats.signal_strength_pct < 0 ? 1 : stats.signal_strength_pct,
+                     stats.snr_quality_pct < 0 ? 1 : stats.snr_quality_pct,
+                     stats.symbol_quality_pct < 0 ? 1 : stats.symbol_quality_pct);
         } else if (t->scan_stats_valid && t->scan_stats_freq == t->tuned_frequency_hz) {
             /* No active stream, but a /tunerN/channel scan has published
              * at least one live reading for the frequency we're
@@ -804,6 +837,20 @@ static void *channel_scan_thread_main(void *arg)
         break;
     }
 
+    /* Engage the physical tuner continuously for whichever frequency
+     * this thread last processed, regardless of whether it actually
+     * locked -- matching real hardware, which keeps a selected tuner's
+     * frontend engaged (and reporting whatever live AGC/lock state it
+     * has, even "no signal") rather than only while a client happens
+     * to be actively streaming it. Deliberately done once here, after
+     * the whole pending-queue is drained, rather than per-frequency
+     * inside the loop above -- a fast multi-channel scan
+     * (hdhomerun_config's `scan`) can process dozens of queued
+     * frequencies in a couple seconds, and opening+closing a hold for
+     * each one that's about to be immediately superseded would just be
+     * wasted work. */
+    tuner_open_hold(t, freq, ctx->delivery);
+
     tuner_release(t);
     pthread_mutex_destroy(&ctx->mutex);
     pthread_cond_destroy(&ctx->cond);
@@ -826,6 +873,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * explicit channel=none does, rather than leaving a stale tune
          * that'll misbehave against the new map's frequency plan. */
         udp_push_stop(t);
+        tuner_close_hold(t);
         tuner_lock(t);
         snprintf(t->channelmap, sizeof(t->channelmap), "%s", value);
         snprintf(t->channel, sizeof(t->channel), "none");
@@ -857,6 +905,16 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
         t->filter_override[0] = '\0'; /* new mux — any prior filter's PIDs no longer apply */
         tuner_unlock(t);
+        /* Immediately engage the physical tuner and keep it engaged for
+         * as long as this channel stays selected, matching real
+         * hardware -- without this, /tunerN/status would only ever
+         * show genuinely live signal stats while something was
+         * actively streaming (see tuner_open_hold()'s own comment); a
+         * client that just selects a channel and polls status (e.g. a
+         * signal-monitoring tool) would otherwise see a frozen
+         * one-time snapshot instead. Non-blocking -- doesn't wait for
+         * lock, so this doesn't delay the reply below. */
+        tuner_open_hold(t, ch->frequency_hz, ch->delivery);
 
         char val[32];
         snprintf(val, sizeof(val), "%d.%d", major, minor);
@@ -867,6 +925,7 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
     if (strcmp(leaf, "channel") == 0) {
         if (strcmp(value, "none") == 0) {
             udp_push_stop(t);
+            tuner_close_hold(t);
             tuner_lock(t);
             snprintf(t->channel, sizeof(t->channel), "none");
             t->tuned_frequency_hz = 0;
@@ -891,6 +950,14 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                                         "or \"<channelmap>:<N>\"");
             return;
         }
+
+        /* Close any hold from a *previous* channel selection before
+         * starting this new tune attempt, so a stale old-channel fd
+         * doesn't linger during it -- /tunerN/status correctly falls
+         * back to scan_stats' live in-progress reporting below until
+         * this attempt's own hold gets opened (see
+         * channel_scan_thread_main). */
+        tuner_close_hold(t);
 
         /* Real semantics: /tunerN/channel is a raw RF tune, independent
          * of any specific virtual channel/program selection — that

@@ -99,11 +99,20 @@ the startup full-band scan — goes through the same claim/release pair:
   once-for-everything version made tuner0 a multi-minute dead zone after
   every restart).
 - **`tuner_release()`** — clears `busy`, closes any `active_stream`, wakes
-  one waiter.
+  one waiter, and (see §17) re-engages a background "hold" on the
+  selected channel if one isn't already open, so `/tunerN/status` keeps
+  reporting live stats immediately after streaming ends rather than
+  going stale.
 
 Every field on `struct hdhr_tuner` that isn't set-once-at-init is guarded
 by its own `pthread_mutex_t lock` (`tuner_lock()`/`tuner_unlock()`) — not a
 global lock, so different tuner slots never contend with each other.
+
+`busy`/`active_stream` specifically mean "actively streaming right
+now" — a **separate**, lower-priority concept, `held_fd`, tracks
+"this tuner has a channel selected" (which persists across streaming
+start/stop, and is a completely different physical-hardware-in-use
+question from an active stream). See §16.
 
 ## 4. `/tunerN/channel` SET — why it's the most complicated endpoint
 
@@ -673,7 +682,96 @@ guess at what real firmware would report (the ATSC equivalent,
 display; there was no real cable-tuned device available to confirm
 against here).
 
-## 16. Debugging techniques that worked, worth reusing
+## 16. A selected channel stays engaged even when nothing's streaming
+
+Confirmed live (2026-07-20): with a channel selected via `/tunerN/vchannel`
+but nothing actively streaming it, `/tunerN/status` reported a
+completely frozen `ss=91 snq=89 seq=100` across 8 polls spanning 16
+seconds. That's `scan_stats` (§5) — a one-time snapshot from whichever
+scan/lock-verification attempt last ran, never refreshed again once
+that attempt concluded, by this project's original design: RF tuning
+was deliberately lazy, deferred until an actual stream (`target=`/HTTP)
+opened, specifically so a merely-*selected* channel didn't tie up a
+physical tuner slot other consumers might want (§3's original
+framing). Real firmware doesn't work this way — it engages a selected
+tuner's frontend immediately and keeps it engaged continuously,
+regardless of whether anyone's actively pulling video, and just treats
+that tuner as unavailable to other consumers the whole time. This
+matters for more than fidelity to real behavior: third-party signal-
+monitoring tools that poll many HDHomeRuns' channel+status without
+ever actually streaming them would see this daemon's stats go stale
+the instant a scan/verify finished, which a tool comparing against
+real devices could easily read as "this unit stopped working."
+
+**`held_fd`** (`tuner.h`) is a background frontend fd, separate from
+`active_stream`, kept open+tuned to `tuned_frequency_hz`/`tuned_delivery`
+for as long as a channel stays selected — independent of whether
+anything is actively streaming it. `/tunerN/status` (`control.c`) now
+checks it as a second priority tier, between `active_stream` (unchanged,
+still authoritative when actively streaming) and the `scan_stats`
+snapshot (unchanged, still used for live progress *during* an
+in-flight scan/lock attempt, before this tier's own hold exists yet):
+reads `dvb_frontend_read_stats()` fresh on every single poll, exactly
+like the streaming branch does, so `ss=`/`snq=`/`seq=`/`lock=` are
+always genuinely current — confirmed live: `snq` visibly varied
+(89%↔91%) across repeated polls with nothing streaming, and `lock=`
+now correctly reflects the true demod state immediately (previously,
+`scan_stats`'s fallback path sourced its `lock=` word from `t->status`
+specifically to dodge a *different* staleness issue described in §5 —
+but that word itself was set once by the scan and never updated
+either, so a channel that was, in fact, solidly locked could still
+read `lock=none` indefinitely until the next scan).
+
+**Two new tuner fields** support this: `tuned_delivery` (set alongside
+`tuned_frequency_hz` everywhere it's written — `tuner_bind_channel()`
+and the raw `/tunerN/channel` SET path — so a later re-tune knows 8VSB
+vs. QAM without a channel-database lookup) and `held_legacy_seq` (this
+driver's `seq=` fallback, §5, needs its own persistent windowed state;
+a held tune has no `struct dvb_stream` to own that the way active
+streaming does, so it lives directly on the tuner instead, reset
+whenever a new hold opens).
+
+**Lifecycle, and why it's centralized in `tuner.c` rather than at each
+call site**: `tuner_open_hold()`/`tuner_close_hold()` do the actual
+open/tune/close work (non-blocking — `dvb_frontend_tune_8vsb()`/
+`tune_qam()` don't wait for lock, so opening a hold never risks the
+dead-frequency blocking hazard §4 goes to such length to avoid; a
+held-but-unlocked channel's *later* status polls can still hit that
+hazard inside `dvb_frontend_read_stats()`'s ioctls, same pre-existing
+exposure the active-streaming branch already has, not something new
+here). Rather than have every consumer (`vchannel` SET, the `channel`
+SET scan thread, `udp_stream.c`, `http_server.c`) separately manage
+opening/closing a hold around its own claim, the two existing choke
+points every consumer already passes through absorb it entirely:
+
+- **`tuner_try_claim()`/`tuner_try_claim_wait()`** close an existing
+  hold the instant a claim succeeds — a held fd and an `active_stream`'s
+  own frontend fd must never both be open on the same physical frontend
+  device node at once, and starting a real stream always wins.
+- **`tuner_release()`** re-opens a hold afterward (using the tuner's own
+  remembered `tuned_frequency_hz`/`tuned_delivery`) if a channel is
+  still logically selected and nothing already re-established one in
+  the meantime.
+
+This means `udp_stream.c` and `http_server.c` needed **zero changes** —
+they already call `tuner_try_claim()` before streaming and
+`tuner_release()` after, so the hold transparently steps out of the
+way and comes back on its own. The only call sites that needed direct
+changes are the two places a channel actually gets *selected*:
+`vchannel` SET calls `tuner_open_hold()` synchronously right after
+`tuner_bind_channel()` (cheap and non-blocking, so no background
+thread needed); `channel` SET's existing background scan thread
+(`channel_scan_thread_main`, §4) calls it once after its whole
+pending-queue drains, using whichever frequency it processed last —
+deliberately *not* per-frequency inside that loop, since a fast
+multi-channel scan (`hdhomerun_config scan`) can process dozens of
+queued frequencies in a couple of seconds, and opening+closing a hold
+for each one that's about to be immediately superseded would be pure
+waste. `channelmap` SET and an explicit `channel=none` both call
+`tuner_close_hold()` directly, since either invalidates whatever was
+held.
+
+## 17. Debugging techniques that worked, worth reusing
 
 - **`/proc/<pid>/task/*/stat` sampling** (`ps -eLo tid,stat,wchan,comm`,
   ~100ms interval, piped to a log file, run *concurrently* with a failing
