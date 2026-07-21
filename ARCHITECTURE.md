@@ -697,11 +697,17 @@ framing). Real firmware doesn't work this way — it engages a selected
 tuner's frontend immediately and keeps it engaged continuously,
 regardless of whether anyone's actively pulling video, and just treats
 that tuner as unavailable to other consumers the whole time. This
-matters for more than fidelity to real behavior: third-party signal-
-monitoring tools that poll many HDHomeRuns' channel+status without
-ever actually streaming them would see this daemon's stats go stale
-the instant a scan/verify finished, which a tool comparing against
-real devices could easily read as "this unit stopped working."
+matters for more than fidelity to real behavior. It's the mechanism
+behind the classic real-world use case of watching `hdhomerun_config_gui`'s
+signal meters update live while physically adjusting an antenna,
+without needing to also be actively streaming video the whole time —
+if this daemon only refreshed stats while streaming, that workflow
+would just show a frozen reading no matter how the antenna moved.
+It also matters for third-party signal-monitoring tools that poll many
+HDHomeRuns' channel+status without ever actually streaming them —
+those would see this daemon's stats go stale the instant a scan/verify
+finished, which a tool comparing against real devices could easily
+read as "this unit stopped working."
 
 **`held_fd`** (`tuner.h`) is a background frontend fd, separate from
 `active_stream`, kept open+tuned to `tuned_frequency_hz`/`tuned_delivery`
