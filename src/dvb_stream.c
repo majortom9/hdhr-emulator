@@ -384,9 +384,19 @@ int dvb_stream_frontend_fd(const struct dvb_stream *s)
  * guess like the dBm/dBmV signal-strength scale was. */
 #define ATSC_SEGMENTS_PER_SEC 12935.38
 
-int dvb_stream_get_legacy_seq_pct(struct dvb_stream *s)
+int dvb_stream_get_legacy_seq_pct(struct dvb_stream *s, bool has_lock)
 {
     if (!s) return -1;
+
+    if (!has_lock) {
+        /* See dvb_frontend_legacy_seq_pct()'s identical guard: the
+         * uncorrected-blocks counter doesn't move without a lock, which
+         * this function would otherwise misread as a perfect "zero
+         * errors" window. Reset the baseline too, so a later re-lock
+         * doesn't measure across the unlocked gap. */
+        s->legacy_seq_have_baseline = false;
+        return -1;
+    }
 
     uint32_t ucblocks;
     if (!dvb_frontend_read_legacy_ucblocks(s->frontend_fd, &ucblocks)) {

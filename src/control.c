@@ -419,29 +419,30 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                  * driver (confirmed: lgdt3306a doesn't populate them at
                  * all) — fall back to the legacy FE_READ_UNCORRECTED_BLOCKS
                  * ioctl, windowed against the fixed ATSC segment rate. */
-                int legacy_pct = dvb_stream_get_legacy_seq_pct(t->active_stream);
+                int legacy_pct = dvb_stream_get_legacy_seq_pct(t->active_stream, stats.has_lock);
                 if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
             }
             double bps = 0.0, pps = 0.0;
             dvb_stream_get_rate(t->active_stream, &bps, &pps);
-            /* -1 ("no reading available") collapses to 1, not 0 — the
-             * wire protocol's bare-integer ss=/snq=/seq= fields have no
-             * separate "N/A" slot, and dvb_frontend.c's
-             * clamp_pct_floor1() already floors every genuinely
-             * available reading at 1 too, so a literal 0 is never
-             * emitted by this daemon at all. Some clients (e.g.
-             * libhdhomerun's hdhomerun_device_wait_for_lock()) key off
-             * a low reading to mean "confirmed no signal, stop
-             * polling"; 0 is the value most likely to be special-cased
-             * that way by such logic, so avoid it entirely rather than
-             * pick which case gets to keep it. */
+            /* -1 ("no reading available at all") collapses to 0, same as
+             * a genuinely-measured 0 — this daemon used to floor every
+             * available reading at 1 to keep those two cases visually
+             * distinct, but real hardware genuinely reports a literal 0%
+             * for snq=/seq= once there's no usable signal (confirmed
+             * live, 2026-07-20, on a real HDHomeRun3 tuned to a
+             * no-chance-of-locking channel) — flooring our own reading
+             * was diverging from real behavior, not protecting anything;
+             * see dvb_frontend.c's clamp_pct() comment for why the one
+             * concrete client concern that motivated the floor
+             * (hdhomerun_device_wait_for_lock()'s ss<45 check) was never
+             * actually threatened by a literal 0 vs. 1 either. */
             snprintf(val, sizeof(val),
                      "ch=%s lock=%s ss=%d snq=%d seq=%d bps=%.0f pps=%.0f",
                      t->channel,
                      stats.has_lock ? "8vsb" : "none",
-                     stats.signal_strength_pct < 0 ? 1 : stats.signal_strength_pct,
-                     stats.snr_quality_pct < 0 ? 1 : stats.snr_quality_pct,
-                     stats.symbol_quality_pct < 0 ? 1 : stats.symbol_quality_pct,
+                     stats.signal_strength_pct < 0 ? 0 : stats.signal_strength_pct,
+                     stats.snr_quality_pct < 0 ? 0 : stats.snr_quality_pct,
+                     stats.symbol_quality_pct < 0 ? 0 : stats.symbol_quality_pct,
                      bps, pps);
         } else if (t->held_fd >= 0) {
             /* No active stream, but this channel is still selected and
@@ -456,16 +457,16 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
             struct dvb_signal_stats stats;
             dvb_frontend_read_stats(t->held_fd, &stats);
             if (stats.symbol_quality_pct < 0) {
-                int legacy_pct = dvb_frontend_legacy_seq_pct(t->held_fd, &t->held_legacy_seq);
+                int legacy_pct = dvb_frontend_legacy_seq_pct(t->held_fd, &t->held_legacy_seq, stats.has_lock);
                 if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
             }
             snprintf(val, sizeof(val),
                      "ch=%s lock=%s ss=%d snq=%d seq=%d",
                      t->channel,
                      stats.has_lock ? (t->tuned_delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb") : "none",
-                     stats.signal_strength_pct < 0 ? 1 : stats.signal_strength_pct,
-                     stats.snr_quality_pct < 0 ? 1 : stats.snr_quality_pct,
-                     stats.symbol_quality_pct < 0 ? 1 : stats.symbol_quality_pct);
+                     stats.signal_strength_pct < 0 ? 0 : stats.signal_strength_pct,
+                     stats.snr_quality_pct < 0 ? 0 : stats.snr_quality_pct,
+                     stats.symbol_quality_pct < 0 ? 0 : stats.symbol_quality_pct);
         } else if (t->scan_stats_valid && t->scan_stats_freq == t->tuned_frequency_hz) {
             /* No active stream, but a /tunerN/channel scan has published
              * at least one live reading for the frequency we're
@@ -499,9 +500,9 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
                      "ch=%s lock=%s ss=%d snq=%d seq=%d",
                      t->channel,
                      lock_word,
-                     stats->signal_strength_pct < 0 ? 1 : stats->signal_strength_pct,
-                     stats->snr_quality_pct < 0 ? 1 : stats->snr_quality_pct,
-                     stats->symbol_quality_pct < 0 ? 1 : stats->symbol_quality_pct);
+                     stats->signal_strength_pct < 0 ? 0 : stats->signal_strength_pct,
+                     stats->snr_quality_pct < 0 ? 0 : stats->snr_quality_pct,
+                     stats->symbol_quality_pct < 0 ? 0 : stats->symbol_quality_pct);
         } else {
             snprintf(val, sizeof(val), "%s", t->status);
         }
@@ -749,7 +750,7 @@ static void publish_scan_stats(void *ctx, int fd)
          * before it'll even start checking for programs — without a
          * real seq= here, that 5s wait was unconditional on *every*
          * locked channel, since seq= stayed 0 the entire time. */
-        int legacy_pct = dvb_frontend_legacy_seq_pct(fd, &pc->legacy_seq);
+        int legacy_pct = dvb_frontend_legacy_seq_pct(fd, &pc->legacy_seq, stats.has_lock);
         if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
     }
 

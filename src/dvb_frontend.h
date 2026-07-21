@@ -106,7 +106,16 @@ struct dvb_legacy_seq_state {
  * reporting). Needs at least two calls on the same *state spaced >=0.5s
  * apart before returning a real value (matches
  * dvb_stream_get_legacy_seq_pct's own settle behavior) — returns -1
- * until then, or if the ioctl isn't supported at all. */
-int dvb_frontend_legacy_seq_pct(int fd, struct dvb_legacy_seq_state *state);
+ * until then, or if the ioctl isn't supported at all.
+ *
+ * has_lock: pass the same has_lock this call's caller already got from
+ * dvb_frontend_read_stats() on this fd. Without a lock, the
+ * uncorrected-blocks counter simply never increments (nothing's being
+ * demodulated), which this function would otherwise misread as "zero
+ * errors" — a false 100% reading confirmed live on a channel with no
+ * realistic chance of locking. Returns -1 (and resets the window,
+ * rather than measuring across the unlocked gap) whenever has_lock is
+ * false. */
+int dvb_frontend_legacy_seq_pct(int fd, struct dvb_legacy_seq_state *state, bool has_lock);
 
 #endif /* HDHR_DVB_FRONTEND_H */

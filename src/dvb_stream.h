@@ -1,6 +1,7 @@
 #ifndef HDHR_DVB_STREAM_H
 #define HDHR_DVB_STREAM_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include "dvb_channel.h"
@@ -80,7 +81,13 @@ void dvb_stream_get_rate(const struct dvb_stream *s, double *bits_per_second,
  * provide directly. Returns -1 if the legacy ioctl isn't supported
  * either, or not enough time has passed since stream open to measure a
  * window yet. Caller (control.c) should only use this when the modern
- * stat is unavailable — see dvb_frontend_read_stats(). */
-int dvb_stream_get_legacy_seq_pct(struct dvb_stream *s);
+ * stat is unavailable — see dvb_frontend_read_stats().
+ *
+ * has_lock: pass the same has_lock the caller already got from
+ * dvb_frontend_read_stats() on this stream's frontend fd. The
+ * uncorrected-blocks counter doesn't move without a lock, which this
+ * function would otherwise misread as a perfect "zero errors" window —
+ * returns -1 (and resets the window) whenever has_lock is false. */
+int dvb_stream_get_legacy_seq_pct(struct dvb_stream *s, bool has_lock);
 
 #endif /* HDHR_DVB_STREAM_H */
