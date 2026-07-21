@@ -248,18 +248,14 @@ static const char *scale_name(enum fecap_scale_params scale)
  * (not a single stat converted to a percentage in isolation) — used for
  * DTV_STAT_ERROR_BLOCK_COUNT / DTV_STAT_TOTAL_BLOCK_COUNT, which only
  * mean something as a ratio of each other. Returns -1 if the stat isn't
- * available. */
-static int64_t read_counter_raw(int fd, uint32_t cmd, const char *label)
+ * available. Takes an already-fetched property (see
+ * dvb_frontend_read_stats()'s batched FE_GET_PROPERTY call) rather than
+ * issuing its own ioctl — see that function's own comment for why. */
+static int64_t convert_counter_raw(const struct dtv_property *prop, const char *label)
 {
-    struct dtv_property prop;
-    memset(&prop, 0, sizeof(prop));
-    prop.cmd = cmd;
-    struct dtv_properties props = { .num = 1, .props = &prop };
+    if (prop->u.st.len == 0) return -1;
 
-    if (ioctl(fd, FE_GET_PROPERTY, &props) < 0) return -1;
-    if (prop.u.st.len == 0) return -1;
-
-    struct dtv_stats *s = &prop.u.st.stat[0];
+    const struct dtv_stats *s = &prop->u.st.stat[0];
     if (s->scale != FE_SCALE_COUNTER) return -1; /* not the type we expect for this cmd */
 
     if (g_debug_signal_stats) {
@@ -269,17 +265,13 @@ static int64_t read_counter_raw(int fd, uint32_t cmd, const char *label)
     return (int64_t)s->uvalue;
 }
 
-static int read_stat_property(int fd, uint32_t cmd, const char *label, double db_min, double db_max)
+/* Same idea as convert_counter_raw() — takes an already-fetched
+ * property rather than issuing its own ioctl. */
+static int convert_stat_pct(const struct dtv_property *prop, const char *label, double db_min, double db_max)
 {
-    struct dtv_property prop;
-    memset(&prop, 0, sizeof(prop));
-    prop.cmd = cmd;
-    struct dtv_properties props = { .num = 1, .props = &prop };
+    if (prop->u.st.len == 0) return -1; /* driver doesn't support this stat */
 
-    if (ioctl(fd, FE_GET_PROPERTY, &props) < 0) return -1;
-    if (prop.u.st.len == 0) return -1; /* driver doesn't support this stat */
-
-    struct dtv_stats *s = &prop.u.st.stat[0];
+    const struct dtv_stats *s = &prop->u.st.stat[0];
 
     if (g_debug_signal_stats) {
         if (s->scale == FE_SCALE_DECIBEL) {
@@ -344,6 +336,32 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
         out->has_lock = (status & FE_HAS_LOCK) != 0;
     }
 
+    /* One batched FE_GET_PROPERTY ioctl for all four DTV_STAT_* values,
+     * instead of a separate ioctl per property (this function used to
+     * issue 4, for 5 total per call including FE_READ_STATUS above) --
+     * matching libdvbv5's own dvb_fe_get_stats() (lib/libdvbv5/dvb-fe.c),
+     * confirmed by reading its source directly. This isn't just a micro-
+     * optimization: this project's two "tuners" are actually two
+     * frontends on a single physical dual-tuner USB stick (TBS 5520SE,
+     * one driver instance, confirmed via `lsusb -t`), so every ioctl
+     * here is a real USB control-transfer round-trip contending with
+     * whatever the *other* frontend is doing at that moment -- and each
+     * one is its own independent chance to hit this hardware's
+     * confirmed-live occasional multi-second block (see
+     * held_stats_thread's own comment in tuner.h). Fewer ioctls per
+     * check means less contention and less exposure, for identical
+     * results -- the per-stat scaling/calibration below is unchanged. */
+    struct dtv_property stat_props[4];
+    memset(stat_props, 0, sizeof(stat_props));
+    stat_props[0].cmd = DTV_STAT_SIGNAL_STRENGTH;
+    stat_props[1].cmd = DTV_STAT_CNR;
+    stat_props[2].cmd = DTV_STAT_ERROR_BLOCK_COUNT;
+    stat_props[3].cmd = DTV_STAT_TOTAL_BLOCK_COUNT;
+    struct dtv_properties stat_props_req = { .num = 4, .props = stat_props };
+    if (ioctl(fd, FE_GET_PROPERTY, &stat_props_req) != 0) {
+        return; /* out->*_pct already -1 from the memset above */
+    }
+
     /* DTV_STAT_SIGNAL_STRENGTH on the FE_SCALE_DECIBEL scale is defined
      * by the kernel DVBv5 API itself as 0.001 dBm units (power, not
      * dBmV) — see Documentation/userspace-api/media/dvb/frontend-stat-properties.rst.
@@ -393,8 +411,7 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * educated guess — re-run tools/calibrate_stats.c's sweep against a
      * real device if it drifts again, ideally with a genuinely marginal
      * channel in the mix next time. */
-    out->signal_strength_pct = read_stat_property(fd, DTV_STAT_SIGNAL_STRENGTH,
-                                                   "signal_strength", -90.0, -43.0);
+    out->signal_strength_pct = convert_stat_pct(&stat_props[0], "signal_strength", -90.0, -43.0);
     /* Calibrated against a real HDHomeRun with two reference points:
      * snq=100% at 33dB SNR (the ceiling), and snq clustering ~35-40% at
      * 15.2dB SNR. Solving for the floor that satisfies both (using the
@@ -404,7 +421,7 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * more headroom than "0% at the edge of losing lock" — most
      * solidly-locked signals read comfortably above 50%, and the meter
      * only really drops hard as you approach actual failure. */
-    out->snr_quality_pct = read_stat_property(fd, DTV_STAT_CNR, "cnr", 4.5, 33.0);
+    out->snr_quality_pct = convert_stat_pct(&stat_props[1], "cnr", 4.5, 33.0);
 
     /* DTV_STAT_ERROR_BLOCK_COUNT and DTV_STAT_TOTAL_BLOCK_COUNT are both
      * cumulative counters since the frontend was tuned (per the kernel
@@ -418,8 +435,8 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * two counters: 0 BER (no errors across everything received) is
      * 100%, and the percentage properly reflects the true cumulative
      * error rate rather than a one-way ratchet. */
-    int64_t error_blocks = read_counter_raw(fd, DTV_STAT_ERROR_BLOCK_COUNT, "error_block_count");
-    int64_t total_blocks = read_counter_raw(fd, DTV_STAT_TOTAL_BLOCK_COUNT, "total_block_count");
+    int64_t error_blocks = convert_counter_raw(&stat_props[2], "error_block_count");
+    int64_t total_blocks = convert_counter_raw(&stat_props[3], "total_block_count");
 
     if (error_blocks < 0 || total_blocks <= 0) {
         /* stat(s) unavailable (common on several USB ATSC chipsets), or
