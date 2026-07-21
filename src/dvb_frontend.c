@@ -342,8 +342,9 @@ void dvb_frontend_read_stats(int fd, struct dvb_signal_stats *out)
      * matching libdvbv5's own dvb_fe_get_stats() (lib/libdvbv5/dvb-fe.c),
      * confirmed by reading its source directly. This isn't just a micro-
      * optimization: this project's two "tuners" are actually two
-     * frontends on a single physical dual-tuner USB stick (TBS 5520SE,
-     * one driver instance, confirmed via `lsusb -t`), so every ioctl
+     * frontends on a single physical dual-tuner USB stick (a Hauppauge
+     * WinTV-dualHD, one em28xx driver instance, confirmed via
+     * `lsusb -t`), so every ioctl
      * here is a real USB control-transfer round-trip contending with
      * whatever the *other* frontend is doing at that moment -- and each
      * one is its own independent chance to hit this hardware's
