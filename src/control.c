@@ -819,11 +819,21 @@ static void *channel_scan_thread_main(void *arg)
     tuner_resolve_stale_held_fd(t, ctx->stale_held_fd);
 
     for (;;) {
+        struct timespec attempt_t0;
+        clock_gettime(CLOCK_MONOTONIC, &attempt_t0);
+
         struct scan_progress_ctx pc = { .t = t, .freq = freq };
         int ffd;
         bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, freq,
                                               ctx->delivery, &ffd,
                                               publish_scan_stats, &pc);
+        {
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long ms = (t1.tv_sec - attempt_t0.tv_sec) * 1000L + (t1.tv_nsec - attempt_t0.tv_nsec) / 1000000L;
+            fprintf(stderr, "control: tuner%d/channel: tune_and_lock(%u Hz) locked=%d took %ldms\n",
+                    t->index, freq, locked, ms);
+        }
 
         pthread_mutex_lock(&ctx->mutex);
         ctx->locked = locked;
@@ -857,8 +867,15 @@ static void *channel_scan_thread_main(void *arg)
             usleep(600 * 1000);
             publish_scan_stats(&pc, ffd);
 
-            dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, rf_channel, freq,
+            struct timespec psip_t0;
+            clock_gettime(CLOCK_MONOTONIC, &psip_t0);
+            int n_found = dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, rf_channel, freq,
                                 ctx->delivery, ffd);
+            struct timespec psip_t1;
+            clock_gettime(CLOCK_MONOTONIC, &psip_t1);
+            long psip_ms = (psip_t1.tv_sec - psip_t0.tv_sec) * 1000L + (psip_t1.tv_nsec - psip_t0.tv_nsec) / 1000000L;
+            fprintf(stderr, "control: tuner%d/channel: read_psip(%u Hz) found=%d took %ldms\n",
+                    t->index, freq, n_found, psip_ms);
         }
 
         /* Dequeue the next queued request (see the FIFO's own comment
