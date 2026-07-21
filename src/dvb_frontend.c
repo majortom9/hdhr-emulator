@@ -35,7 +35,23 @@ void dvb_frontend_close(int fd)
 
 int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
 {
-    struct dtv_property props[4];
+    /* DTV_TUNE bundled into the SAME ioctl call as DTV_CLEAR/DELIVERY_
+     * SYSTEM/MODULATION/FREQUENCY, not a separate FE_SET_PROPERTY call
+     * afterward (this function used to issue two) -- matching
+     * libdvbv5's own __dvb_fe_set_parms() (lib/libdvbv5/dvb-fe.c,
+     * source read directly), which always appends DTV_TUNE onto the
+     * same properties array as one atomic commit. Splitting it into
+     * two separate ioctls left a real window between "properties set"
+     * and "tune committed" where this hardware could apparently get
+     * confused: confirmed live via dmesg (2026-07-21) that a scan could
+     * hit a long run of consecutive lgdt3306a_init/si2157_init pairs
+     * with no lgdt3306a_search ever following -- i.e. the demod/tuner
+     * chips kept re-initializing without ever reaching the actual
+     * lock-search phase -- right where a scan started silently missing
+     * channels with otherwise-solid confirmed signal (509/503MHz among
+     * them). atscdx (via libdvbv5) doesn't split the ioctl and doesn't
+     * exhibit this. */
+    struct dtv_property props[5];
     memset(props, 0, sizeof(props));
 
     props[0].cmd = DTV_CLEAR;
@@ -45,18 +61,12 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
     props[2].u.data = VSB_8;
     props[3].cmd = DTV_FREQUENCY;
     props[3].u.data = frequency_hz;
+    props[4].cmd = DTV_TUNE;
 
-    struct dtv_properties clear_and_set = { .num = 4, .props = props };
-    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_set) < 0) {
+    struct dtv_properties clear_and_tune = { .num = 5, .props = props };
+    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_tune) < 0) {
         fprintf(stderr, "dvb_frontend: FE_SET_PROPERTY (freq=%u) failed: %s\n",
                 frequency_hz, strerror(errno));
-        return -1;
-    }
-
-    struct dtv_property tune_prop = { .cmd = DTV_TUNE };
-    struct dtv_properties tune = { .num = 1, .props = &tune_prop };
-    if (ioctl(fd, FE_SET_PROPERTY, &tune) < 0) {
-        fprintf(stderr, "dvb_frontend: DTV_TUNE failed: %s\n", strerror(errno));
         return -1;
     }
     return 0;
@@ -87,7 +97,10 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
 
 int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz)
 {
-    struct dtv_property props[5];
+    /* DTV_TUNE bundled into the same ioctl call as the other properties
+     * -- see dvb_frontend_tune_8vsb()'s comment for why (this used to
+     * be two separate FE_SET_PROPERTY calls here too). */
+    struct dtv_property props[6];
     memset(props, 0, sizeof(props));
 
     props[0].cmd = DTV_CLEAR;
@@ -99,18 +112,12 @@ int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz)
     props[3].u.data = HDHR_QAM_SYMBOL_RATE;
     props[4].cmd = DTV_FREQUENCY;
     props[4].u.data = frequency_hz;
+    props[5].cmd = DTV_TUNE;
 
-    struct dtv_properties clear_and_set = { .num = 5, .props = props };
-    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_set) < 0) {
+    struct dtv_properties clear_and_tune = { .num = 6, .props = props };
+    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_tune) < 0) {
         fprintf(stderr, "dvb_frontend: FE_SET_PROPERTY QAM (freq=%u) failed: %s\n",
                 frequency_hz, strerror(errno));
-        return -1;
-    }
-
-    struct dtv_property tune_prop = { .cmd = DTV_TUNE };
-    struct dtv_properties tune = { .num = 1, .props = &tune_prop };
-    if (ioctl(fd, FE_SET_PROPERTY, &tune) < 0) {
-        fprintf(stderr, "dvb_frontend: DTV_TUNE (QAM) failed: %s\n", strerror(errno));
         return -1;
     }
     return 0;
