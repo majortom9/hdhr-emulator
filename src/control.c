@@ -381,6 +381,32 @@ static void compute_auto_filter(struct hdhr_tuner *t, char *out, size_t out_len)
     pid_filter_format(pids, count, out, out_len);
 }
 
+/* Temporary diagnostic (added 2026-07-20, remove once resolved):
+ * investigating an intermittent "communication error" reported by real
+ * hdhomerun_config `scan` runs. Leading theory: dvb_frontend_read_stats()
+ * calls several DTV_STAT_* ioctls on this exact driver (lgdt3306a),
+ * which is *already* documented elsewhere in this codebase (see
+ * dvb_frontend.c's PROGRESS_CB_INTERVAL_MS comment) to occasionally
+ * block for multiple seconds under marginal-signal conditions — that
+ * finding was specific to the scan-progress path, which throttles how
+ * often it calls in specifically to dodge this; a plain /tunerN/status
+ * GET has no such throttle and calls it fresh on every single poll, on
+ * the same connection thread that's supposed to reply fast. 800ms is
+ * comfortably under libhdhomerun's own 2500ms GETSET recv timeout, so a
+ * log here would mean a real client's own request very plausibly timed
+ * out on this exact call. */
+#define SLOW_STAT_READ_WARN_MS 800
+
+static void log_if_slow(const char *label, int tuner_idx, const struct timespec *start)
+{
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    long ms = (end.tv_sec - start->tv_sec) * 1000L + (end.tv_nsec - start->tv_nsec) / 1000000L;
+    if (ms >= SLOW_STAT_READ_WARN_MS) {
+        fprintf(stderr, "control: tuner%d: %s took %ldms\n", tuner_idx, label, ms);
+    }
+}
+
 static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, const char *leaf)
 {
     char val[512];
@@ -413,7 +439,10 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
         int ffd = t->active_stream ? dvb_stream_frontend_fd(t->active_stream) : -1;
         if (ffd >= 0) {
             struct dvb_signal_stats stats;
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             dvb_frontend_read_stats(ffd, &stats);
+            log_if_slow("dvb_frontend_read_stats (active_stream)", t->index, &t0);
             if (stats.symbol_quality_pct < 0) {
                 /* Modern DVBv5 block-count stats unavailable on this
                  * driver (confirmed: lgdt3306a doesn't populate them at
@@ -455,7 +484,10 @@ static void handle_tuner_get(int fd, struct hdhr_tuner *t, const char *name, con
              * can lag behind t->status), since this is a fresh read on
              * every single poll. */
             struct dvb_signal_stats stats;
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             dvb_frontend_read_stats(t->held_fd, &stats);
+            log_if_slow("dvb_frontend_read_stats (held_fd)", t->index, &t0);
             if (stats.symbol_quality_pct < 0) {
                 int legacy_pct = dvb_frontend_legacy_seq_pct(t->held_fd, &t->held_legacy_seq, stats.has_lock);
                 if (legacy_pct >= 0) stats.symbol_quality_pct = legacy_pct;
@@ -1022,28 +1054,41 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                  * for that worker to drain (see channel_scan_thread_main
                  * and tuner.h's pending_queue) instead of either
                  * blocking this reply or refusing outright. The queue is
-                 * sized generously above the ATSC frequency table count,
-                 * but if it's somehow still full, fall back to a plain
-                 * busy refusal rather than silently dropping a request. */
-                if (t->pending_count < TUNER_PENDING_QUEUE_CAP) {
-                    int tail = (t->pending_head + t->pending_count) % TUNER_PENDING_QUEUE_CAP;
-                    t->pending_queue[tail].freq = freq;
-                    t->pending_queue[tail].rf_channel = rf_channel;
-                    t->pending_count++;
-                    t->tuned_frequency_hz = freq;
-                    t->vch_resolved = false;
-                    t->filter_override[0] = '\0';
-                    snprintf(t->channel, sizeof(t->channel), "%s:%u",
-                             delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
-                    snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
-                    tuner_unlock(t);
-                    send_value_reply(fd, name, t->channel);
-                    return;
+                 * sized generously above the ATSC frequency table count
+                 * (40 vs. 35) — a single real scan should never fill it,
+                 * so if it's somehow still full, that's not a busy scan
+                 * making healthy progress, it's backlog left over from
+                 * repeated/overlapping scan attempts (confirmed live:
+                 * running `scan` again before a previous run's worker had
+                 * drained piled a second full band's worth of requests
+                 * behind the first, and it kept happening on every
+                 * further attempt since the queue never got a chance to
+                 * empty out). Refusing outright used to mean *every*
+                 * request for the rest of that backlog's lifetime failed
+                 * too — potentially minutes of a scan looking completely
+                 * broken. Whoever queued all that has almost certainly
+                 * already moved on, so drop it and start fresh with just
+                 * this newest request instead of compounding the
+                 * problem further. */
+                if (t->pending_count >= TUNER_PENDING_QUEUE_CAP) {
+                    fprintf(stderr, "control: tuner%d/channel: pending queue was full (%d queued) --"
+                                     " dropping stale backlog, starting fresh with %s\n",
+                                     t->index, t->pending_count, value);
+                    t->pending_head = 0;
+                    t->pending_count = 0;
                 }
+                int tail = (t->pending_head + t->pending_count) % TUNER_PENDING_QUEUE_CAP;
+                t->pending_queue[tail].freq = freq;
+                t->pending_queue[tail].rf_channel = rf_channel;
+                t->pending_count++;
+                t->tuned_frequency_hz = freq;
+                t->vch_resolved = false;
+                t->filter_override[0] = '\0';
+                snprintf(t->channel, sizeof(t->channel), "%s:%u",
+                         delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
+                snprintf(t->status, sizeof(t->status), "ch=%s lock=none", t->channel);
                 tuner_unlock(t);
-                fprintf(stderr, "control: tuner%d/channel SET to %s refused — pending queue full "
-                                 "(%d already queued)\n", t->index, value, TUNER_PENDING_QUEUE_CAP);
-                send_error_reply(fd, name, "ERROR: tuner busy (scan queue full)");
+                send_value_reply(fd, name, t->channel);
                 return;
             }
             tuner_unlock(t);
