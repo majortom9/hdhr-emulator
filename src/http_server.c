@@ -173,15 +173,16 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
         return;
     }
 
+    int reused_fd = -1;
     struct hdhr_tuner *t;
     if (requested_tuner_idx >= 0) {
         t = &tuners[requested_tuner_idx];
-        if (!tuner_try_claim(t)) {
+        if (!tuner_try_claim(t, ch->frequency_hz, ch->delivery, &reused_fd)) {
             send_503(fd, "tuner busy\n");
             return;
         }
     } else {
-        t = tuner_pool_claim_free(tuners, cfg->tuner_count);
+        t = tuner_pool_claim_free(tuners, cfg->tuner_count, ch->frequency_hz, ch->delivery, &reused_fd);
         if (!t) {
             send_503(fd, "all tuners busy\n");
             return;
@@ -192,7 +193,7 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
      * same established asymmetry as program (see tuner.h) — this path
      * always streams the plain named channel. */
     struct dvb_stream *ds = dvb_stream_open(t->adapter, cfg->dvb_frontend, cfg->dvb_demux,
-                                             ch, DVB_PROGRAM_DEFAULT, NULL);
+                                             ch, DVB_PROGRAM_DEFAULT, NULL, reused_fd);
     if (!ds) {
         send_headers(fd, "502 Bad Gateway", "text/plain", 0);
         tuner_release(t);

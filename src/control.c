@@ -1000,7 +1000,12 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * update status whenever it's actually done.
          * channel_scan_thread_main() owns releasing the claim taken here
          * once nothing's left queued. */
-        if (!tuner_try_claim(t)) {
+        /* Not interested in held-fd reuse here (out_reused_fd NULL) --
+         * this path always does its own fresh tune+PSIP scan via
+         * dvb_scan_tune_and_lock(), never dvb_stream_open(), so there's
+         * nothing to hand an adopted fd to; any existing hold is simply
+         * closed, same as before. */
+        if (!tuner_try_claim(t, 0, HDHR_DELIVERY_ATSC_VSB, NULL)) {
             tuner_lock(t);
             bool has_active_stream = (t->active_stream != NULL);
             if (!has_active_stream) {

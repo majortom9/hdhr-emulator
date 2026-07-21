@@ -55,7 +55,8 @@ static void *push_thread_main(void *arg)
         goto done_no_claim;
     }
 
-    if (!tuner_try_claim(t)) {
+    int reused_fd = -1;
+    if (!tuner_try_claim(t, ctx->channel.frequency_hz, ctx->channel.delivery, &reused_fd)) {
         fprintf(stderr, "udp_stream: tuner%d: already in use by another stream, "
                          "refusing target= push\n", t->index);
         close(sock);
@@ -63,7 +64,8 @@ static void *push_thread_main(void *arg)
     }
 
     struct dvb_stream *ds = dvb_stream_open(t->adapter, ctx->cfg.dvb_frontend, ctx->cfg.dvb_demux,
-                                             &ctx->channel, ctx->program_override, ctx->pid_filter);
+                                             &ctx->channel, ctx->program_override, ctx->pid_filter,
+                                             reused_fd);
     if (!ds) {
         fprintf(stderr, "udp_stream: tuner%d: failed to open DVB stream for %d.%d\n",
                 t->index, ctx->channel.major, ctx->channel.minor);

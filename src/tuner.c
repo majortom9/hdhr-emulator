@@ -25,7 +25,33 @@ void tuner_pool_init(struct hdhr_tuner *tuners, int count, const struct hdhr_con
 void tuner_lock(struct hdhr_tuner *t)   { pthread_mutex_lock(&t->lock); }
 void tuner_unlock(struct hdhr_tuner *t) { pthread_mutex_unlock(&t->lock); }
 
-bool tuner_try_claim(struct hdhr_tuner *t)
+/* Shared by tuner_try_claim()/tuner_try_claim_wait() once busy has been
+ * claimed and held_fd/tuned_frequency_hz/tuned_delivery captured under
+ * the lock — resolves the captured held fd against the caller's wanted
+ * freq/delivery, either handing it back via *out_reused_fd (ownership
+ * transferred, do NOT close) or closing it, per tuner_try_claim()'s own
+ * doc comment. Takes the tuner's tuned_freq_hz/tuned_delivery as params
+ * (rather than reading t-> directly) since it runs outside the lock
+ * (dvb_frontend_close() can block) and those fields aren't otherwise
+ * guaranteed stable once busy is claimed. */
+static void resolve_claimed_hold(int held, uint32_t tuned_freq_hz,
+                                   enum hdhr_delivery_system tuned_delivery,
+                                   uint32_t want_freq_hz, enum hdhr_delivery_system want_delivery,
+                                   int *out_reused_fd)
+{
+    bool reuse = (held >= 0 && out_reused_fd &&
+                  tuned_freq_hz == want_freq_hz && tuned_delivery == want_delivery);
+    if (reuse) {
+        *out_reused_fd = held;
+        return;
+    }
+    if (out_reused_fd) *out_reused_fd = -1;
+    if (held >= 0) dvb_frontend_close(held); /* see held_fd's own comment: never
+                                                * concurrent with an active_stream's fd */
+}
+
+bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
+                      enum hdhr_delivery_system want_delivery, int *out_reused_fd)
 {
     tuner_lock(t);
     if (t->busy) {
@@ -35,14 +61,16 @@ bool tuner_try_claim(struct hdhr_tuner *t)
     t->busy = true;
     int held = t->held_fd;
     t->held_fd = -1;
+    uint32_t tuned_freq_hz = t->tuned_frequency_hz;
+    enum hdhr_delivery_system tuned_delivery = t->tuned_delivery;
     tuner_unlock(t);
 
-    if (held >= 0) dvb_frontend_close(held); /* see held_fd's own comment: never
-                                                * concurrent with an active_stream's fd */
+    resolve_claimed_hold(held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
     return true;
 }
 
-bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms)
+bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_freq_hz,
+                           enum hdhr_delivery_system want_delivery, int *out_reused_fd)
 {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
@@ -68,9 +96,11 @@ bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms)
     t->busy = true;
     int held = t->held_fd;
     t->held_fd = -1;
+    uint32_t tuned_freq_hz = t->tuned_frequency_hz;
+    enum hdhr_delivery_system tuned_delivery = t->tuned_delivery;
     tuner_unlock(t);
 
-    if (held >= 0) dvb_frontend_close(held);
+    resolve_claimed_hold(held, tuned_freq_hz, tuned_delivery, want_freq_hz, want_delivery, out_reused_fd);
     return true;
 }
 
@@ -157,10 +187,13 @@ void tuner_close_hold(struct hdhr_tuner *t)
     if (fd >= 0) dvb_frontend_close(fd);
 }
 
-struct hdhr_tuner *tuner_pool_claim_free(struct hdhr_tuner *tuners, int count)
+struct hdhr_tuner *tuner_pool_claim_free(struct hdhr_tuner *tuners, int count,
+                                           uint32_t want_freq_hz,
+                                           enum hdhr_delivery_system want_delivery,
+                                           int *out_reused_fd)
 {
     for (int i = 0; i < count; i++) {
-        if (tuner_try_claim(&tuners[i])) return &tuners[i];
+        if (tuner_try_claim(&tuners[i], want_freq_hz, want_delivery, out_reused_fd)) return &tuners[i];
     }
     return NULL;
 }

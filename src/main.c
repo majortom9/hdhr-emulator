@@ -81,7 +81,7 @@ static void *scan_thread_main(void *arg)
 
     int total = 0;
     for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
-        if (!tuner_try_claim_wait(&g_tuners[0], SCAN_STEP_CLAIM_WAIT_MS)) {
+        if (!tuner_try_claim_wait(&g_tuners[0], SCAN_STEP_CLAIM_WAIT_MS, 0, HDHR_DELIVERY_ATSC_VSB, NULL)) {
             fprintf(stderr, "dvb_scan: tuner0 busy, skipping %u Hz this pass\n",
                     atsc_freq_table[i].frequency_hz);
             continue;

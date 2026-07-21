@@ -33,10 +33,22 @@ struct dvb_stream;
  * is too wide to enumerate as individual demux PES filters (e.g. the
  * real device's own "0x0000-0x1fff" default, or anything else spanning
  * more than MAX_DEMUX_FDS-1 PIDs) falls back to full-mux passthrough
- * instead of failing outright. */
+ * instead of failing outright.
+ *
+ * adopt_fd: -1 to open+tune+wait-for-lock a fresh frontend fd as usual;
+ * >=0 to adopt an already-open frontend fd that's already tuned and
+ * locked to `channel`'s mux (ownership transfers in either case — on
+ * success dvb_stream owns it, on failure this function closes it).
+ * This is tuner_try_claim()'s held-fd handoff (see tuner.h): closing an
+ * already-locked hold just to reopen+relock the same frequency from
+ * scratch a moment later isn't just wasteful, it can genuinely fail —
+ * confirmed live, this driver doesn't always relock within
+ * LOCK_TIMEOUT_MS on an immediate close/reopen of the same frontend,
+ * even though the hold had it solidly locked seconds earlier. */
 struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
                                     const struct dvb_channel *channel,
-                                    int program_override, const char *pid_filter);
+                                    int program_override, const char *pid_filter,
+                                    int adopt_fd);
 
 /* Blocking read, same contract tvh_stream_read() had: 0 = EOF/closing,
  * -1 = error, otherwise bytes read. */

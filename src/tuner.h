@@ -223,11 +223,23 @@ void tuner_unlock(struct hdhr_tuner *t);
  * must then either try a different tuner (HTTP auto-allocation) or
  * report "tuner busy" (an explicit /tunerN/... request). On success the
  * caller owns the tuner until tuner_release(); it's expected to open a
- * dvb_stream and store it via tuner_set_stream(). Also closes this
- * tuner's background hold (see held_fd/tuner_open_hold()) if one is
- * open, since a hold and an active_stream's own frontend fd must never
- * both be open on the same physical frontend device node at once. */
-bool tuner_try_claim(struct hdhr_tuner *t);
+ * dvb_stream and store it via tuner_set_stream().
+ *
+ * Also resolves this tuner's background hold (see held_fd/
+ * tuner_open_hold()), if one is open, since a hold and an
+ * active_stream's own frontend fd must never both be open on the same
+ * physical frontend device node at once. If out_reused_fd is non-NULL
+ * and the hold is already tuned to want_freq_hz/want_delivery, ownership
+ * of that already-open, already-*locked* fd transfers to the caller via
+ * *out_reused_fd instead of being closed — pass it straight through to
+ * dvb_stream_open()'s adopt_fd. Closing an already-locked hold only to
+ * have the caller reopen+relock the same frequency a moment later isn't
+ * just wasteful, it can genuinely fail to relock in time (confirmed
+ * live) — reusing it sidesteps that entirely. If out_reused_fd is NULL,
+ * or the hold doesn't match, any open hold is simply closed as before
+ * and *out_reused_fd (if given) is set to -1. */
+bool tuner_try_claim(struct hdhr_tuner *t, uint32_t want_freq_hz,
+                      enum hdhr_delivery_system want_delivery, int *out_reused_fd);
 
 /* Like tuner_try_claim(), but if the tuner is already busy, waits up to
  * timeout_ms for it to free up (woken by tuner_release()) instead of
@@ -236,9 +248,11 @@ bool tuner_try_claim(struct hdhr_tuner *t);
  * scan's next frequency, right behind the previous one's) rather than
  * ones that should fail fast if the tuner isn't immediately available
  * (e.g. a live stream request, which still wants tuner_try_claim()).
- * Returns false if still busy after the timeout. Closes an existing
- * hold on success, same as tuner_try_claim(). */
-bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms);
+ * Returns false if still busy after the timeout. Resolves an existing
+ * hold on success, same as tuner_try_claim() (see its comment for the
+ * want_freq_hz/want_delivery/out_reused_fd reuse behavior). */
+bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_freq_hz,
+                           enum hdhr_delivery_system want_delivery, int *out_reused_fd);
 
 /* Records the dvb_stream now backing this (already-claimed) tuner, so
  * other code (e.g. status/streaminfo reporting) can see it. */
@@ -286,7 +300,12 @@ void tuner_close_hold(struct hdhr_tuner *t);
 /* Scans for the first idle tuner and claims it. Returns NULL if all
  * tuners are currently busy. Used by HTTP's channel-only /auto/vX.X
  * path, which doesn't name a specific tuner slot — same auto-allocation
- * behavior real HDHomeRun firmware provides across its N tuners. */
-struct hdhr_tuner *tuner_pool_claim_free(struct hdhr_tuner *tuners, int count);
+ * behavior real HDHomeRun firmware provides across its N tuners.
+ * want_freq_hz/want_delivery/out_reused_fd are passed straight through
+ * to each candidate's tuner_try_claim() — see its comment. */
+struct hdhr_tuner *tuner_pool_claim_free(struct hdhr_tuner *tuners, int count,
+                                           uint32_t want_freq_hz,
+                                           enum hdhr_delivery_system want_delivery,
+                                           int *out_reused_fd);
 
 #endif /* HDHR_TUNER_H */

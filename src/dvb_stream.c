@@ -182,7 +182,8 @@ static void *reader_thread_main(void *arg)
 
 struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
                                     const struct dvb_channel *channel,
-                                    int program_override, const char *pid_filter)
+                                    int program_override, const char *pid_filter,
+                                    int adopt_fd)
 {
     struct dvb_stream *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -190,27 +191,34 @@ struct dvb_stream *dvb_stream_open(int adapter, int frontend, int demux_num,
     pthread_cond_init(&s->not_empty, NULL);
     pthread_cond_init(&s->not_full, NULL);
 
-    s->frontend_fd = dvb_frontend_open(adapter, frontend);
-    if (s->frontend_fd < 0) { free(s); return NULL; }
+    if (adopt_fd >= 0) {
+        /* Already open, tuned, and locked — see this function's own
+         * comment in dvb_stream.h for why the caller hands us this
+         * instead of a fresh fd to open ourselves. */
+        s->frontend_fd = adopt_fd;
+    } else {
+        s->frontend_fd = dvb_frontend_open(adapter, frontend);
+        if (s->frontend_fd < 0) { free(s); return NULL; }
 
-    /* channel->delivery (stamped at scan time — see dvb_scan.c) tells us
-     * which tune function this mux actually needs; a stream open only
-     * gets the dvb_channel pointer, not whatever channelmap was active
-     * when it was originally scanned. */
-    int tune_rc = (channel->delivery == HDHR_DELIVERY_QAM)
-                  ? dvb_frontend_tune_qam(s->frontend_fd, channel->frequency_hz)
-                  : dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz);
-    if (tune_rc != 0) {
-        dvb_frontend_close(s->frontend_fd);
-        free(s);
-        return NULL;
-    }
-    if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL)) {
-        fprintf(stderr, "dvb_stream: no lock on %u Hz for %d.%d\n",
-                channel->frequency_hz, channel->major, channel->minor);
-        dvb_frontend_close(s->frontend_fd);
-        free(s);
-        return NULL;
+        /* channel->delivery (stamped at scan time — see dvb_scan.c) tells
+         * us which tune function this mux actually needs; a stream open
+         * only gets the dvb_channel pointer, not whatever channelmap was
+         * active when it was originally scanned. */
+        int tune_rc = (channel->delivery == HDHR_DELIVERY_QAM)
+                      ? dvb_frontend_tune_qam(s->frontend_fd, channel->frequency_hz)
+                      : dvb_frontend_tune_8vsb(s->frontend_fd, channel->frequency_hz);
+        if (tune_rc != 0) {
+            dvb_frontend_close(s->frontend_fd);
+            free(s);
+            return NULL;
+        }
+        if (!dvb_frontend_wait_lock(s->frontend_fd, LOCK_TIMEOUT_MS, NULL, NULL)) {
+            fprintf(stderr, "dvb_stream: no lock on %u Hz for %d.%d\n",
+                    channel->frequency_hz, channel->major, channel->minor);
+            dvb_frontend_close(s->frontend_fd);
+            free(s);
+            return NULL;
+        }
     }
 
     bool ok = true;
