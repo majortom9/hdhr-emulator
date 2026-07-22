@@ -234,6 +234,36 @@ struct hdhr_tuner {
     int      pending_head;  /* index of the next entry to dequeue */
     int      pending_count; /* number of entries currently queued */
 
+    /* Signaled whenever something new is pushed onto pending_queue (see
+     * handle_tuner_set's queuing branch). channel_scan_thread_main waits
+     * on this briefly (PENDING_WAIT_MS, control.c) instead of exiting the
+     * instant it finds the queue empty -- confirmed live (2026-07-21) via
+     * a scan-thread-invocation counter that a real client's own pacing
+     * between /tunerN/channel SETs routinely outlasts how long our own
+     * worker takes to process the current frequency, so the queue is
+     * often still genuinely empty the moment we finish. Exiting right
+     * then meant the worker released the tuner and fully closed its
+     * held-open frontend fd, only for the client's very next SET to spawn
+     * a *fresh* channel_scan_thread_main with a *fresh*
+     * dvb_frontend_open() -- silently defeating open-once-per-batch
+     * (confirmed via dmesg: 9 separate invocations logged across a single
+     * 35-frequency scan, each its own chance at a chip re-init, largely
+     * explaining why this path kept showing ~23 re-inits per scan even
+     * after both the frontend and PAT/VCT fds were switched to open-once-
+     * reuse-many). A short bounded wait bridges most of those gaps
+     * instead, without adding any new queueing semantics -- the FIFO
+     * itself stays exactly as-is, since it's solving a different, real
+     * problem (see pending_queue's own comment): replying to a SET
+     * immediately, rather than blocking until the real tune result is
+     * known, is what keeps a slow/dead frequency (confirmed up to ~8s
+     * worst case, driver-internal and uninterruptible) from exceeding a
+     * real client's own total reply patience (libhdhomerun's
+     * HDHOMERUN_CONTROL_RECV_TIMEOUT is 2500ms, retried once -- so ~5s
+     * total, confirmed by reading hdhomerun_control.c directly -- shorter
+     * than our own worst case) and surfacing as a hard communication
+     * error. */
+    pthread_cond_t pending_cond;
+
     /* set by udp_stream.c while a target= push is active, so control.c
      * knows whether to stop a previous push before starting a new one */
     volatile int udp_push_active;

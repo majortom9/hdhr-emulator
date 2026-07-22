@@ -714,6 +714,24 @@ static bool parse_channel_value(const char *channelmap, const char *value,
  * this is a real FIFO rather than a single overwritable slot. */
 #define CHANNEL_SET_WAIT_MS 1800
 
+/* How long channel_scan_thread_main waits on an empty pending_queue for
+ * one more request before actually giving up and releasing the tuner --
+ * see pending_cond's own comment in tuner.h for the confirmed-live
+ * problem this solves (the worker exiting and a fresh invocation
+ * reopening the frontend, defeating open-once-per-batch and causing a
+ * real chip re-init on nearly every such restart). Measured live
+ * (2026-07-21) via a wait-duration diagnostic: an earlier 3000ms bound
+ * missed most gaps outright (the wait routinely ran out the full 3000ms
+ * with nothing arriving at all, not just cutting it close), consistent
+ * with the client's own per-channel cycle -- up to ~2.5s local
+ * wait-for-lock polling plus up to several more seconds of streaminfo
+ * settling on a channel that actually locked -- often exceeding 3s
+ * end to end. 6000ms is still comfortably under a full scan's own
+ * total duration and doesn't meaningfully delay other consumers once a
+ * scan has genuinely finished (nothing more queued for a full 6s is a
+ * good sign the client is actually done, not just between channels). */
+#define PENDING_WAIT_MS 6000
+
 struct channel_scan_ctx {
     struct hdhr_tuner *t;
     const struct hdhr_config *cfg;
@@ -918,8 +936,40 @@ static void *channel_scan_thread_main(void *arg)
 
         /* Dequeue the next queued request (see the FIFO's own comment
          * in tuner.h) before releasing the tuner, instead of always
-         * releasing here and making the next SET wait to reclaim it. */
+         * releasing here and making the next SET wait to reclaim it.
+         *
+         * If the queue is empty, wait up to PENDING_WAIT_MS for one more
+         * request before actually giving up -- see pending_cond's own
+         * comment in tuner.h. Without this, a real client's own pacing
+         * between SETs (it locally polls status/streaminfo for a while
+         * before sending the next one) routinely outlasted how long we
+         * take to process the current frequency, so the queue was often
+         * still genuinely empty right here -- exiting immediately meant
+         * this thread released the tuner and closed its held-open
+         * frontend fd, only for the very next SET to spawn a fresh
+         * invocation of this function with a fresh dvb_frontend_open()
+         * (confirmed live via an invocation counter: 9 separate restarts
+         * across one 35-frequency scan), each one its own chance at a
+         * chip re-init -- silently defeating the whole point of holding
+         * one fd open across a batch. */
         tuner_lock(t);
+        if (t->pending_count == 0) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += PENDING_WAIT_MS / 1000;
+            deadline.tv_nsec += (PENDING_WAIT_MS % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec += 1;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            while (t->pending_count == 0) {
+                if (pthread_cond_timedwait(&t->pending_cond, &t->lock, &deadline) == ETIMEDOUT) {
+                    break; /* recheck pending_count below rather than trusting the return
+                            * code alone -- same reasoning as tuner_try_claim_wait's own
+                            * timedwait loop */
+                }
+            }
+        }
         if (t->pending_count > 0) {
             freq = t->pending_queue[t->pending_head].freq;
             rf_channel = t->pending_queue[t->pending_head].rf_channel;
@@ -1190,6 +1240,9 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                 t->pending_queue[tail].freq = freq;
                 t->pending_queue[tail].rf_channel = rf_channel;
                 t->pending_count++;
+                /* Wakes channel_scan_thread_main if it's currently waiting
+                 * on an empty queue (see pending_cond's own comment). */
+                pthread_cond_signal(&t->pending_cond);
                 t->tuned_frequency_hz = freq;
                 t->vch_resolved = false;
                 t->filter_override[0] = '\0';
