@@ -258,16 +258,26 @@ void tuner_release(struct hdhr_tuner *t)
     }
 }
 
-void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_system delivery)
+/* Closes any existing hold on this tuner, clearing held_fd first so a
+ * concurrent /tunerN/status read never observes a half-torn-down hold.
+ * Returns false (leaving any existing hold untouched) if active_stream
+ * is set -- callers must not proceed to open a new hold in that case,
+ * same as tuner_open_hold()'s always-had active_stream check. Shared by
+ * both tuner_open_hold() and tuner_open_hold_from_fd(), since either
+ * one needs the *previous* hold's fd closed before a new fd can be
+ * opened on the same physical frontend device node (only one fd at a
+ * time) -- tuner_open_hold_from_fd()'s fd is already open on arrival,
+ * so this must run before that fd is installed, not after. */
+static bool close_existing_hold_for_new_one(struct hdhr_tuner *t)
 {
     tuner_lock(t);
     if (t->active_stream) {
         /* Someone's actively streaming this tuner already -- its own
-         * frontend fd already serves live status, and opening a second
-         * fd on the same physical frontend device node here would
-         * conflict with it. */
+         * frontend fd already serves live status, and a second held fd
+         * on the same physical frontend device node here would conflict
+         * with it. */
         tuner_unlock(t);
-        return;
+        return false;
     }
     int old_held = t->held_fd;
     t->held_fd = -1;
@@ -276,21 +286,19 @@ void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_
         stop_held_stats_thread(t); /* must finish before old_held is closed */
         dvb_frontend_close(old_held);
     }
+    return true;
+}
 
-    int fd = dvb_frontend_open(t->adapter, t->frontend);
-    if (fd < 0) return;
-
-    int rc = (delivery == HDHR_DELIVERY_QAM) ? dvb_frontend_tune_qam(fd, freq_hz)
-                                              : dvb_frontend_tune_8vsb(fd, freq_hz);
-    if (rc != 0) {
-        dvb_frontend_close(fd);
-        return;
-    }
-
+/* Installs an already-open, already-tuned fd as this tuner's new
+ * held_fd and starts its background stats refresher. Closes `fd` itself
+ * (never leaks it) if another thread raced in and already established a
+ * hold since close_existing_hold_for_new_one() ran. */
+static void install_hold_fd(struct hdhr_tuner *t, int fd)
+{
     tuner_lock(t);
     /* Recheck -- another thread could have raced in (started actively
-     * streaming, or opened its own hold) while we were opening this fd
-     * outside the lock. */
+     * streaming, or opened its own hold) while we were closing the old
+     * one / opening this new one, both outside the lock. */
     if (t->active_stream || t->held_fd >= 0) {
         tuner_unlock(t);
         dvb_frontend_close(fd);
@@ -315,6 +323,31 @@ void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_
         t->held_stats_thread_started = false;
     }
     tuner_unlock(t);
+}
+
+void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_system delivery)
+{
+    if (!close_existing_hold_for_new_one(t)) return;
+
+    int fd = dvb_frontend_open(t->adapter, t->frontend);
+    if (fd < 0) return;
+
+    int rc = (delivery == HDHR_DELIVERY_QAM) ? dvb_frontend_tune_qam(fd, freq_hz)
+                                              : dvb_frontend_tune_8vsb(fd, freq_hz);
+    if (rc != 0) {
+        dvb_frontend_close(fd);
+        return;
+    }
+    install_hold_fd(t, fd);
+}
+
+void tuner_open_hold_from_fd(struct hdhr_tuner *t, int fd)
+{
+    if (!close_existing_hold_for_new_one(t)) {
+        dvb_frontend_close(fd);
+        return;
+    }
+    install_hold_fd(t, fd);
 }
 
 void tuner_close_hold(struct hdhr_tuner *t)

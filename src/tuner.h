@@ -411,6 +411,31 @@ void tuner_bind_channel(struct hdhr_tuner *t, const struct dvb_channel *ch, int 
  * same physical frontend device node here would conflict with it. */
 void tuner_open_hold(struct hdhr_tuner *t, uint32_t freq_hz, enum hdhr_delivery_system delivery);
 
+/* Same end state as tuner_open_hold(), but takes ownership of an
+ * already-open, already-tuned (and, in the common case, already-locked)
+ * frontend fd directly instead of opening a fresh one and retuning from
+ * scratch -- for a caller (control.c's channel_scan_thread_main) that
+ * just finished its own dvb_scan_tune_and_lock() on this exact fd/
+ * frequency and would otherwise be throwing away a perfectly good, live
+ * lock only to immediately redo the same work. Confirmed live
+ * (2026-07-21): the old close-then-tuner_open_hold() sequence meant the
+ * driver had to briefly reacquire lock all over again on the fresh
+ * retune, which /tunerN/status genuinely (not a placeholder) reported
+ * as a real "lock=none ss=0" dip for several seconds before recovering
+ * -- cosmetically harmless when it happened within the first second or
+ * so after a SET (which real clients already expect and tolerate while
+ * confirming initial lock), but a visible, confusing false "signal
+ * lost" once it started happening several seconds *after* status had
+ * already shown a solid, confirmed lock (a side effect of
+ * channel_scan_thread_main's own pending_cond wait delaying when this
+ * handoff happens -- see PENDING_WAIT_MS in control.c).
+ *
+ * Same active_stream/race-recheck semantics as tuner_open_hold() (see
+ * its own comment) -- if either applies, this closes fd itself rather
+ * than leaking it, same as the fresh-open path already did on its own
+ * failure returns. */
+void tuner_open_hold_from_fd(struct hdhr_tuner *t, int fd);
+
 /* Closes any open hold without opening a new one -- e.g. an explicit
  * /tunerN/channel=none SET or a channelmap change. Safe to call with
  * no hold open. */

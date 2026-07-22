@@ -993,12 +993,6 @@ static void *channel_scan_thread_main(void *arg)
         break;
     }
 
-    /* Must close before tuner_open_hold() below -- it opens its own
-     * fresh fd on this same physical frontend, which can't succeed
-     * while this scan's own fd is still open (see
-     * dvb_scan_tune_and_lock()'s own comment on why this thread gets
-     * to keep one fd open across the whole drain in the first place). */
-    if (have_ffd) dvb_frontend_close(ffd);
     if (pat_fd >= 0) mpeg_section_filter_close(pat_fd);
     if (vct_fd >= 0) mpeg_section_filter_close(vct_fd);
 
@@ -1013,8 +1007,47 @@ static void *channel_scan_thread_main(void *arg)
      * (hdhomerun_config's `scan`) can process dozens of queued
      * frequencies in a couple seconds, and opening+closing a hold for
      * each one that's about to be immediately superseded would just be
-     * wasted work. */
-    tuner_open_hold(t, freq, ctx->delivery);
+     * wasted work.
+     *
+     * Only if the tuner's *current* selection still actually matches
+     * `freq` -- otherwise some other request (a channel=none, or a
+     * completely different channel SET on another connection) changed
+     * it while this thread was in the pending_cond wait above, and
+     * blindly re-holding our own stale `freq` here would stomp that
+     * newer, already-applied state right back to what we were last
+     * working on. Confirmed live (2026-07-21): with the wait above now
+     * able to run up to PENDING_WAIT_MS (6s), a user manually stepping
+     * channels (hdhomerun_config_gui's scan up/down, which is just a
+     * raw /tunerN/channel SET per press) followed shortly after by a
+     * channel=none left /tunerN/status reporting a real, live lock on
+     * the *previous* channel with "ch=none" -- this thread's own
+     * leftover hold from before the wait was even added, since the
+     * race window (near-instant exit, pre-fix) simply never got wide
+     * enough to hit in practice until now.
+     *
+     * Hands off ffd directly (tuner_open_hold_from_fd(), not
+     * tuner_open_hold()) rather than closing it and having that
+     * function open+retune a fresh one from scratch -- ffd is already
+     * open and tuned to exactly `freq` (and, in the common case,
+     * already locked, since dvb_scan_tune_and_lock() just ran on it).
+     * Confirmed live (2026-07-21): the old close-then-reopen sequence
+     * meant the driver had to briefly reacquire lock all over again,
+     * which /tunerN/status genuinely (not a placeholder) reported as a
+     * real multi-second "lock=none ss=0" dip -- harmless when it
+     * happened within the first second after a SET (clients already
+     * tolerate that while confirming initial lock), but a confusing
+     * false "signal lost" once the pending_cond wait above started
+     * delaying it to several seconds *after* status had already shown
+     * a solid, confirmed lock. See tuner_open_hold_from_fd()'s own
+     * comment in tuner.h. */
+    tuner_lock(t);
+    bool still_current = (t->tuned_frequency_hz == freq);
+    tuner_unlock(t);
+    if (still_current && have_ffd) {
+        tuner_open_hold_from_fd(t, ffd);
+    } else if (have_ffd) {
+        dvb_frontend_close(ffd);
+    }
 
     /* Clear before releasing the claim -- see scan_worker_active's own
      * comment in tuner.h. Nothing can queue behind this thread once
