@@ -16,17 +16,22 @@
 #include <poll.h>
 #include <time.h>
 
-/* Was 1500ms. Tried 300ms (matching atscdx's own ~150-200ms patience)
- * to dodge this hardware's confirmed occasional multi-second stall
- * inside a single tune-and-wait-for-lock call -- real regression, only
- * 5 virtual channels found vs. the usual 40-70+. Tried 600ms next --
- * recovered only the strongest signals (6 RF channels, all -47 to
+/* Was 1500ms originally. Tried 300ms (matching atscdx's own ~150-200ms
+ * patience) to dodge this hardware's confirmed occasional multi-second
+ * stall inside a single tune-and-wait-for-lock call -- real regression,
+ * only 5 virtual channels found vs. the usual 40-70+. Tried 600ms next
+ * -- recovered only the strongest signals (6 RF channels, all -47 to
  * -51dBm); every medium-strength channel that reliably locks at 1500ms
  * (-54 to -58dBm range) still failed. The relationship looks
  * continuous, not a cliff with a sweet spot -- weaker signals
  * genuinely need more time to lock, which is real RF physics, not a
- * bug. 1000ms next: expected around 10 RF channels if the curve holds. */
-#define LOCK_TIMEOUT_MS       1000
+ * bug. 1000ms next was still a real (smaller) regression against the
+ * original 1500ms on medium-strength channels -- reverted back to
+ * 1500ms once the actual re-init/queue-backlog bugs elsewhere in the
+ * scan pipeline were fixed (see control.c/main.c), confirming those,
+ * not the lock timeout, were the real source of the earlier scan
+ * reliability problems this shorter timeout was originally chasing. */
+#define LOCK_TIMEOUT_MS       1500
 #define SECTION_READ_TIMEOUT_MS 2000
 #define PMT_MAX_PROGRAMS_TEMP  PAT_MAX_ENTRIES
 

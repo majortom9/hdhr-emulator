@@ -200,6 +200,76 @@ struct hdhr_tuner {
      * the tuner. */
     bool     scan_worker_active;
 
+    /* Identifies the current "selection session" -- bumped whenever a
+     * /tunerN/channel SET starts a genuinely NEW one (a fresh, non-
+     * queued claim spawning a new channel_scan_thread_main; an explicit
+     * "none"; or a channelmap change, both of which reset the
+     * selection outright), but left UNCHANGED as that same worker
+     * drains its own pending_queue backlog -- those are all still part
+     * of the one session that started them, not independent new ones.
+     * control.c's channel_scan_thread_main captures this value once, at
+     * spawn time, into channel_scan_ctx.generation, and compares it
+     * against the tuner's current value before publishing a live result
+     * for ANY frequency it works on (see finalize_lock_result() and
+     * tuner_open_hold_from_fd()'s call site in control.c) -- if they
+     * still match, the tuner hasn't been reassigned to a genuinely
+     * different session since this worker started, so it's safe to
+     * publish. Deliberately generation-based rather than comparing
+     * against t->tuned_frequency_hz (an earlier version of both checks
+     * did that): tuned_frequency_hz gets overwritten by EVERY newly
+     * queued request within the SAME session too, so comparing against
+     * it made a worker's genuinely fresh result for an earlier-queued
+     * frequency look "stale" the moment a client queued anything past
+     * it -- confirmed live (2026-07-21): hdhomerun_config_gui's scan
+     * up/down buttons advance roughly every ~1.5s regardless of
+     * whether this daemon has actually finished the current frequency
+     * (a real DVB tune attempt is 700ms-8s, dominated by the driver's
+     * own dead-frequency handling), so by the time the worker reaches
+     * and locks an early-queued frequency, tuned_frequency_hz had
+     * almost always already moved on to something queued later --
+     * silently dropping the genuine lock and letting the GUI's own
+     * scan-stops-on-lock logic never see it, running to the end of the
+     * band instead of stopping on the first real signal. Generation
+     * only changes on an actual session boundary, so a worker can
+     * freely publish live progress for whichever frequency it's
+     * CURRENTLY, physically on -- accurately reflecting real hardware
+     * state -- while still correctly going silent the moment something
+     * genuinely different (a channel=none, a channelmap change)
+     * supersedes it. */
+    uint32_t scan_generation;
+
+    /* Broadcast by control.c's channel_scan_thread_main every time it
+     * finishes a real dvb_scan_tune_and_lock() attempt -- for the very
+     * first frequency in a session AND every subsequent one it dequeues
+     * from pending_queue, not just the first. Lets ANY connection
+     * thread whose own /tunerN/channel SET is waiting on a specific
+     * (generation, freq) pair wake up and grab the real result the
+     * moment it's known, whether that request got a fresh claim or was
+     * queued behind an already-running worker -- both cases now get the
+     * same fair, bounded (CHANNEL_SET_WAIT_MS, control.c) wait for
+     * their own genuine answer instead of only the very first request
+     * in a batch getting one and everything after it settling for an
+     * instant placeholder reply. Confirmed live (2026-07-21) this
+     * distinction is exactly why hdhomerun_config_gui's scan up/down
+     * stopped reliably auto-stopping on a real lock a few versions back
+     * (when the worker still exited almost immediately whenever its
+     * queue emptied, so nearly every one of the GUI's own requests
+     * landed on a free tuner and got the fresh-claim, synchronously-
+     * confirmed treatment) and started failing to once PENDING_WAIT_MS
+     * made the worker stay alive across the GUI's entire multi-request
+     * session -- every request after the first then got queued with an
+     * instant, unconfirmed reply instead. last_attempt_generation lets
+     * a waiter reject a broadcast for a completely different (since-
+     * superseded) session outright, same reasoning as scan_generation's
+     * own comment above. Guarded by `lock`, broadcast via a dedicated
+     * cond var (not free_cond/pending_cond, which mean different things
+     * -- see their own comments) so a waiter here is never spuriously
+     * woken by an unrelated tuner_release() or pending_queue push. */
+    pthread_cond_t result_cond;
+    uint32_t last_attempt_freq;
+    bool     last_attempt_locked;
+    uint32_t last_attempt_generation;
+
     /* FIFO of /tunerN/channel SETs that arrived while a previous one's
      * scan thread (control.c's channel_scan_thread_main) is still
      * running on this tuner. Rather than block each request's reply

@@ -693,26 +693,51 @@ static bool parse_channel_value(const char *channelmap, const char *value,
  * background thread, so the SET reply isn't hostage to the DVB driver's
  * worst-case blocking behavior on a dead frequency (see the comment at
  * the SET handler's call site). The calling connection thread waits on
- * `cond` for up to CHANNEL_SET_WAIT_MS for the *lock* result specifically
- * (not the full PSIP read, which can legitimately take longer on a busy
- * mux) so it can reply with an accurate lock status in the common case;
- * `caller_gave_up` tells this thread whether it or the caller is
- * responsible for finalizing tuner state and freeing this struct.
+ * `t->result_cond` (see its own comment in tuner.h) for up to
+ * CHANNEL_SET_WAIT_MS for the *lock* result specifically (not the full
+ * PSIP read, which can legitimately take longer on a busy mux) so it can
+ * reply with an accurate lock status in the common case.
  *
  * A /tunerN/channel SET that arrives while this thread is still running
  * doesn't wait for the tuner to free up at all (see handle_tuner_set's
  * channel branch) — it enqueues its frequency onto t->pending_queue (a
- * bounded FIFO, see tuner.h) and replies immediately. Once this thread
- * finishes its current attempt, it dequeues the next entry before
- * releasing the tuner and, if there is one, loops around to tune it next
- * instead of exiting — so back-to-back requests (e.g. hdhomerun_config's
- * `scan`, which fires its next SET as soon as it gets *any* reply for
- * the current one) hand off to this same in-flight worker rather than a
- * fresh request ever blocking on tuner_try_claim, no matter how long the
- * DVB driver's worst case takes. Every queued frequency eventually gets
- * a real attempt, in order — see tuner.h's pending_queue comment for why
- * this is a real FIFO rather than a single overwritable slot. */
-#define CHANNEL_SET_WAIT_MS 1800
+ * bounded FIFO, see tuner.h) and, exactly like the very first request in
+ * a batch, then waits on the same result_cond for its own turn. Once
+ * this thread finishes its current attempt, it dequeues the next entry
+ * before releasing the tuner and, if there is one, loops around to tune
+ * it next instead of exiting — so back-to-back requests (e.g.
+ * hdhomerun_config's `scan`, which fires its next SET as soon as it gets
+ * *any* reply for the current one) hand off to this same in-flight
+ * worker rather than a fresh request ever blocking on tuner_try_claim,
+ * no matter how long the DVB driver's worst case takes. Every queued
+ * frequency eventually gets a real attempt, in order — see tuner.h's
+ * pending_queue comment for why this is a real FIFO rather than a single
+ * overwritable slot. */
+/* Must exceed this hardware's typical real per-frequency processing
+ * time (confirmed live, 2026-07-22: failed-lock attempts routinely take
+ * ~1950-2260ms, not the ~1500ms LOCK_TIMEOUT_MS alone would suggest --
+ * real ioctl/driver overhead on top), not just approximate it. At the
+ * previous value (1800ms), the connection thread's own wait consistently
+ * timed out *before* the worker even finished its current attempt.
+ * 2300ms comfortably exceeds the typical real duration while staying
+ * under a real client's own single-attempt reply patience
+ * (libhdhomerun's HDHOMERUN_CONTROL_RECV_TIMEOUT is 2500ms, confirmed by
+ * reading hdhomerun_control.c directly) -- occasionally missing that
+ * margin on a driver's own worst-case dead-frequency block (confirmed up
+ * to ~8s) is still fine, since the client retries once more on its own
+ * before treating it as a real communication error.
+ *
+ * Raising this alone does NOT guarantee a synchronous client (e.g.
+ * hdhomerun_config_gui's scan up/down) always gets its own answer in
+ * time -- see the "KNOWN LIMITATION" note at the queued-request wait
+ * below for why: real per-frequency cost on this hardware is close
+ * enough to this budget itself that there's very little margin left
+ * over once a client's own request pacing is also gated on our reply,
+ * confirmed via a live packet capture and extensive testing -- not a
+ * queueing bug (queue depth was confirmed 0, i.e. no backlog, when
+ * this still happened). hdhomerun_config's own `scan` and direct
+ * /tunerN/status polling are both unaffected. */
+#define CHANNEL_SET_WAIT_MS 2300
 
 /* How long channel_scan_thread_main waits on an empty pending_queue for
  * one more request before actually giving up and releasing the tuner --
@@ -741,31 +766,38 @@ struct channel_scan_ctx {
     int stale_held_fd; /* from tuner_try_claim_fast() -- see channel_scan_thread_main's
                           * own first action, and tuner_try_claim_fast()'s comment for
                           * why resolving it can't happen on the connection thread. */
-
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    bool lock_known;      /* set once dvb_scan_tune_and_lock returns */
-    bool locked;          /* valid once lock_known */
-    bool caller_gave_up;  /* set by the caller if it stopped waiting */
+    uint32_t generation; /* captured from t->scan_generation at spawn time -- see its
+                             own comment in tuner.h for why this, not tuned_frequency_hz,
+                             is the right staleness check for this worker's own results. */
 };
 
-/* Finalizes tuner state after the lock result is known. Only touches
- * status if the tuner is still on the frequency we scanned — if the
- * client already moved on (another /channel SET, or a "none") while we
- * were working, our result is stale and shouldn't clobber the current
- * one. */
+/* Finalizes tuner state after the lock result for `freq` is known.
+ * Publishes it as long as the tuner's current selection *session* is
+ * still the one this result came from (see scan_generation's own
+ * comment in tuner.h) -- NOT gated on whether `freq` is still the
+ * latest-requested frequency, since a worker draining its own
+ * pending_queue backlog will routinely finish an EARLIER-queued
+ * frequency after a client has already queued LATER ones in the same
+ * session; that's still a live, genuine, worth-publishing result, not
+ * a stale one. Formats "ch=" from `freq`/`delivery` directly rather
+ * than echoing t->channel, since t->channel reflects the latest
+ * REQUESTED target, which by the time this runs may well be a later
+ * frequency than the one this specific result is actually about. */
 static void finalize_lock_result(struct hdhr_tuner *t, uint32_t freq, bool locked,
-                                  enum hdhr_delivery_system delivery)
+                                  enum hdhr_delivery_system delivery, uint32_t generation)
 {
     tuner_lock(t);
-    if (t->tuned_frequency_hz == freq) {
+    if (t->scan_generation == generation) {
         /* "qam" rather than the specific "qam64"/"qam256" constellation:
          * we tune with QAM_AUTO (see dvb_frontend_tune_qam()) and don't
          * read back which one the driver actually locked, unlike 8VSB
          * where there's only one possibility. UNTESTED against real
          * cable signal either way. */
         const char *lock_word = locked ? (delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb") : "none";
-        snprintf(t->status, sizeof(t->status), "ch=%s lock=%s", t->channel, lock_word);
+        char ch_str[32];
+        snprintf(ch_str, sizeof(ch_str), "%s:%u",
+                 delivery == HDHR_DELIVERY_QAM ? "qam" : "8vsb", freq);
+        snprintf(t->status, sizeof(t->status), "ch=%s lock=%s", ch_str, lock_word);
     }
     tuner_unlock(t);
 }
@@ -890,18 +922,22 @@ static void *channel_scan_thread_main(void *arg)
                     t->index, freq, locked, ms);
         }
 
-        pthread_mutex_lock(&ctx->mutex);
-        ctx->locked = locked;
-        ctx->lock_known = true;
-        bool must_finalize = ctx->caller_gave_up;
-        pthread_cond_signal(&ctx->cond);
-        pthread_mutex_unlock(&ctx->mutex);
-
-        if (must_finalize) {
-            /* The caller already replied without us — this thread now owns
-             * reporting the lock result once it's known. */
-            finalize_lock_result(t, freq, locked, ctx->delivery);
-        }
+        /* Publish this attempt's result immediately -- before PSIP
+         * reading, which can take a while longer -- so any connection
+         * thread waiting on result_cond for exactly this (generation,
+         * freq) pair (see its own comment in tuner.h) gets its answer
+         * as soon as it's genuinely known, whether this is the very
+         * first frequency in this session or one dequeued from
+         * pending_queue. finalize_lock_result() is safe to call
+         * unconditionally now -- it's generation-gated, not tied to
+         * whether any particular caller is still around waiting. */
+        tuner_lock(t);
+        t->last_attempt_freq = freq;
+        t->last_attempt_locked = locked;
+        t->last_attempt_generation = ctx->generation;
+        pthread_cond_broadcast(&t->result_cond);
+        tuner_unlock(t);
+        finalize_lock_result(t, freq, locked, ctx->delivery, ctx->generation);
 
         if (locked) {
             /* Give the legacy uncorrected-blocks counter a real window
@@ -976,17 +1012,6 @@ static void *channel_scan_thread_main(void *arg)
             t->pending_head = (t->pending_head + 1) % TUNER_PENDING_QUEUE_CAP;
             t->pending_count--;
             tuner_unlock(t);
-
-            pthread_mutex_lock(&ctx->mutex);
-            ctx->freq = freq;
-            ctx->rf_channel = rf_channel;
-            ctx->lock_known = false;
-            ctx->locked = false;
-            /* Whoever queued this one already got its own immediate
-             * reply and isn't waiting on ctx->cond — this thread is the
-             * only one left who can finalize its result. */
-            ctx->caller_gave_up = true;
-            pthread_mutex_unlock(&ctx->mutex);
             continue;
         }
         tuner_unlock(t);
@@ -1009,21 +1034,25 @@ static void *channel_scan_thread_main(void *arg)
      * each one that's about to be immediately superseded would just be
      * wasted work.
      *
-     * Only if the tuner's *current* selection still actually matches
-     * `freq` -- otherwise some other request (a channel=none, or a
-     * completely different channel SET on another connection) changed
-     * it while this thread was in the pending_cond wait above, and
-     * blindly re-holding our own stale `freq` here would stomp that
-     * newer, already-applied state right back to what we were last
-     * working on. Confirmed live (2026-07-21): with the wait above now
-     * able to run up to PENDING_WAIT_MS (6s), a user manually stepping
-     * channels (hdhomerun_config_gui's scan up/down, which is just a
-     * raw /tunerN/channel SET per press) followed shortly after by a
-     * channel=none left /tunerN/status reporting a real, live lock on
-     * the *previous* channel with "ch=none" -- this thread's own
+     * Only if this is still the tuner's current selection *session* --
+     * see scan_generation's own comment in tuner.h. Otherwise some
+     * other request (a channel=none, or a channelmap change) ended it
+     * while this thread was in the pending_cond wait above, and
+     * blindly re-holding our own now-superseded `freq` here would stomp
+     * that newer, already-applied state right back to what we were
+     * last working on. Confirmed live (2026-07-21): with the wait above
+     * now able to run up to PENDING_WAIT_MS (6s), a user manually
+     * stepping channels (hdhomerun_config_gui's scan up/down, which is
+     * just a raw /tunerN/channel SET per press) followed shortly after
+     * by a channel=none left /tunerN/status reporting a real, live lock
+     * on the *previous* channel with "ch=none" -- this thread's own
      * leftover hold from before the wait was even added, since the
      * race window (near-instant exit, pre-fix) simply never got wide
-     * enough to hit in practice until now.
+     * enough to hit in practice until now. (This used to compare
+     * against t->tuned_frequency_hz instead -- wrong for the same
+     * reason finalize_lock_result() switched away from it: that field
+     * also changes on every new request WITHIN this same session, not
+     * just on a genuine session boundary.)
      *
      * Hands off ffd directly (tuner_open_hold_from_fd(), not
      * tuner_open_hold()) rather than closing it and having that
@@ -1041,7 +1070,7 @@ static void *channel_scan_thread_main(void *arg)
      * a solid, confirmed lock. See tuner_open_hold_from_fd()'s own
      * comment in tuner.h. */
     tuner_lock(t);
-    bool still_current = (t->tuned_frequency_hz == freq);
+    bool still_current = (t->scan_generation == ctx->generation);
     tuner_unlock(t);
     if (still_current && have_ffd) {
         tuner_open_hold_from_fd(t, ffd);
@@ -1056,8 +1085,6 @@ static void *channel_scan_thread_main(void *arg)
     t->scan_worker_active = false;
     tuner_unlock(t);
     tuner_release(t);
-    pthread_mutex_destroy(&ctx->mutex);
-    pthread_cond_destroy(&ctx->cond);
     free(ctx);
     return NULL;
 }
@@ -1084,6 +1111,11 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         t->tuned_frequency_hz = 0;
         t->vch_resolved = false;
         t->filter_override[0] = '\0';
+        /* Explicit end of the current selection session -- see
+         * scan_generation's own comment in tuner.h and channel=none's
+         * own identical bump just above (this is the same reset, just
+         * via a channelmap change instead). */
+        t->scan_generation++;
         /* "ch=none lock=none ss=0 snq=0 seq=0 bps=0 pps=0" — matches a
          * genuine HDHomeRun3's own idle status verbatim (see
          * tuner_pool_init()'s comment for why the "ch=" token
@@ -1139,6 +1171,12 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             t->tuned_frequency_hz = 0;
             t->vch_resolved = false;
             t->filter_override[0] = '\0';
+            /* Explicit end of the current selection session -- see
+             * scan_generation's own comment in tuner.h. Any in-flight
+             * scan worker's *future* results (it may still be mid-
+             * backlog, see PENDING_WAIT_MS) are now for a superseded
+             * session and won't publish over this. */
+            t->scan_generation++;
             /* Matches a genuine HDHomeRun3's own idle status verbatim —
              * see tuner_pool_init()'s comment for why the "ch=" token
              * specifically matters, not just cosmetics. */
@@ -1261,7 +1299,27 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                  * broken. Whoever queued all that has almost certainly
                  * already moved on, so drop it and start fresh with just
                  * this newest request instead of compounding the
-                 * problem further. */
+                 * problem further.
+                 *
+                 * Deliberately NOT a small proactive threshold anymore --
+                 * an earlier version (PENDING_BACKLOG_LIMIT=2) dropped
+                 * the backlog the instant more than 2 requests piled up,
+                 * on the theory that it'd keep live status from trailing
+                 * a fast client (hdhomerun_config_gui's scan up/down) too
+                 * far behind. Confirmed live (2026-07-21) via the real
+                 * GUI (not a synthetic reproduction) that this actively
+                 * broke correctness: it repeatedly dropped 2-3 already-
+                 * queued channels at a time, including known-good ones
+                 * (177MHz among them) that would have locked and
+                 * correctly stopped the scan -- discarding a channel
+                 * outright is strictly worse than merely reporting it
+                 * late, since finalize_lock_result() now publishes any
+                 * genuine result for a frequency the worker actually
+                 * gets to reach, no matter how deep in the backlog (see
+                 * scan_generation's own comment in tuner.h) -- so once
+                 * genuine results reliably surface, there's no need to
+                 * pre-emptively drop anything; only truly-unbounded
+                 * backlog (the ~40-deep case below) still needs a reset. */
                 if (t->pending_count >= TUNER_PENDING_QUEUE_CAP) {
                     fprintf(stderr, "control: tuner%d/channel: pending queue was full (%d queued) --"
                                      " dropping stale backlog, starting fresh with %s\n",
@@ -1306,7 +1364,64 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                  * again in practice. */
                 snprintf(t->status, sizeof(t->status),
                          "ch=%s lock=none ss=45 snq=0 seq=0 bps=0 pps=0", t->channel);
+                /* Session this request is joining -- queuing never bumps
+                 * scan_generation itself (see its own comment in
+                 * tuner.h), it just joins whatever session is already
+                 * running. */
+                uint32_t generation = t->scan_generation;
                 tuner_unlock(t);
+
+                /* Wait for THIS specific frequency's real result, same
+                 * bounded budget (CHANNEL_SET_WAIT_MS) and same
+                 * reasoning as the fresh-claim path just below -- see
+                 * result_cond's own comment in tuner.h for why queued
+                 * requests need this exactly as much as the first one
+                 * in a batch does. finalize_lock_result() (called by
+                 * channel_scan_thread_main itself) will have already
+                 * updated t->status by the time this returns with a
+                 * match, so the reply below is sent only once a real
+                 * answer -- or the same timeout budget as every other
+                 * request gets -- has passed.
+                 *
+                 * KNOWN LIMITATION (2026-07-22): this budget, however
+                 * generous, is not always enough for a client whose own
+                 * request pacing is itself gated on our reply (e.g.
+                 * hdhomerun_config_gui's scan up/down, confirmed via a
+                 * live packet capture and extensive live testing) --
+                 * real per-frequency processing on this hardware
+                 * routinely runs close to or above CHANNEL_SET_WAIT_MS
+                 * itself (dominated by the LOCK_TIMEOUT_MS this project
+                 * deliberately keeps for weak-signal sensitivity), which
+                 * leaves near-zero margin once even a single queued
+                 * request is involved -- confirmed queue depth was
+                 * consistently 0 (no backlog build-up) when this still
+                 * happened, so it isn't a queueing bug; it's a genuine,
+                 * thin-margin timing mismatch between this hardware's
+                 * real lock-attempt cost and a synchronous GUI client's
+                 * own request cadence. The underlying generation/freq
+                 * matching mechanism itself is correct (verified via
+                 * direct value comparison and a controlled, faithful
+                 * client simulation, both 100% reliable) -- when this
+                 * budget is missed, the client just gets an unconfirmed
+                 * placeholder reply and has to learn the real result
+                 * from its own next /tunerN/status poll instead, same
+                 * as it always could. hdhomerun_config's own `scan` and
+                 * direct /tunerN/status checks are unaffected -- both
+                 * fully reliable. */
+                struct timespec deadline;
+                clock_gettime(CLOCK_REALTIME, &deadline);
+                deadline.tv_sec += CHANNEL_SET_WAIT_MS / 1000;
+                deadline.tv_nsec += (long)(CHANNEL_SET_WAIT_MS % 1000) * 1000000L;
+                if (deadline.tv_nsec >= 1000000000L) {
+                    deadline.tv_nsec -= 1000000000L;
+                    deadline.tv_sec += 1;
+                }
+                tuner_lock(t);
+                while (!(t->last_attempt_generation == generation && t->last_attempt_freq == freq)) {
+                    if (pthread_cond_timedwait(&t->result_cond, &t->lock, &deadline) == ETIMEDOUT) break;
+                }
+                tuner_unlock(t);
+
                 send_value_reply(fd, name, t->channel);
                 return;
             }
@@ -1361,6 +1476,12 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * own comment in tuner.h. Cleared by channel_scan_thread_main
          * right before it releases the tuner. */
         t->scan_worker_active = true;
+        /* A genuinely NEW selection session starts here -- see
+         * scan_generation's own comment in tuner.h. Bumped (not just
+         * read) so any earlier session's worker, if still finishing up
+         * a stale-hold teardown or similar, is unambiguously superseded
+         * from this point on. */
+        uint32_t generation = ++t->scan_generation;
         tuner_unlock(t);
 
         struct channel_scan_ctx *ctx = malloc(sizeof(*ctx));
@@ -1369,18 +1490,12 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         ctx->rf_channel = rf_channel;
         ctx->freq = freq;
         ctx->delivery = delivery;
+        ctx->generation = generation;
         ctx->stale_held_fd = stale_held_fd;
-        pthread_mutex_init(&ctx->mutex, NULL);
-        pthread_cond_init(&ctx->cond, NULL);
-        ctx->lock_known = false;
-        ctx->locked = false;
-        ctx->caller_gave_up = false;
 
         pthread_t th;
         if (pthread_create(&th, NULL, channel_scan_thread_main, ctx) != 0) {
             fprintf(stderr, "control: tuner%d/channel: failed to start scan thread\n", t->index);
-            pthread_mutex_destroy(&ctx->mutex);
-            pthread_cond_destroy(&ctx->cond);
             /* channel_scan_thread_main never runs to do this itself --
              * resolve it here instead so a stale hold's fd/thread don't
              * leak. Blocking here is acceptable: this is the rare
@@ -1398,6 +1513,17 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         }
         pthread_detach(th);
 
+        /* Wait for THIS specific frequency's real result via
+         * result_cond (see its own comment in tuner.h) -- same
+         * mechanism and same bounded budget the queued-request path
+         * above uses, since (with channel_scan_thread_main now able to
+         * stay alive across a whole multi-request session, see
+         * PENDING_WAIT_MS) this connection's own request is no longer
+         * reliably the only one ever waiting synchronously for a real
+         * answer. finalize_lock_result() (called by
+         * channel_scan_thread_main itself, unconditionally) will have
+         * already updated t->status by the time this returns with a
+         * match. */
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
         deadline.tv_sec += CHANNEL_SET_WAIT_MS / 1000;
@@ -1406,17 +1532,11 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
             deadline.tv_nsec -= 1000000000L;
             deadline.tv_sec += 1;
         }
-
-        pthread_mutex_lock(&ctx->mutex);
-        while (!ctx->lock_known) {
-            if (pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &deadline) == ETIMEDOUT) break;
+        tuner_lock(t);
+        while (!(t->last_attempt_generation == generation && t->last_attempt_freq == freq)) {
+            if (pthread_cond_timedwait(&t->result_cond, &t->lock, &deadline) == ETIMEDOUT) break;
         }
-        bool have_result = ctx->lock_known;
-        bool locked_result = ctx->locked;
-        if (!have_result) ctx->caller_gave_up = true;
-        pthread_mutex_unlock(&ctx->mutex);
-
-        if (have_result) finalize_lock_result(t, freq, locked_result, delivery);
+        tuner_unlock(t);
 
         send_value_reply(fd, name, t->channel);
         return;
