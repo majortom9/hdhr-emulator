@@ -179,6 +179,27 @@ struct hdhr_tuner {
     bool     busy;
     struct dvb_stream *active_stream;
 
+    /* True only while control.c's channel_scan_thread_main actually owns
+     * this tuner's claim -- distinct from `busy`, which also goes true
+     * for claims nothing drains a queue for (main.c's one-shot startup
+     * scan, which talks to the adapter/frontend/demux directly and has
+     * no notion of pending_queue at all). handle_tuner_set's /tunerN/
+     * channel SET path checks this before deciding to enqueue a request
+     * onto pending_queue below: queueing only makes sense if some
+     * worker will actually drain it. Confirmed live: once main.c's
+     * startup scan started holding its claim for the whole ~1-2 minute
+     * scan instead of releasing between frequencies, a SET landing
+     * during that window got silently queued here with nothing to ever
+     * service it -- /tunerN/status looked like it worked (tuner_release()'s
+     * own "re-establish a hold on the last tuned frequency" coincidentally
+     * picked up the frequency the queuing code had stashed and opened a
+     * real tuned hold on it) but /tunerN/vchannel stayed "none" forever,
+     * since no actual PSIP scan ever ran for it. Set true by
+     * handle_tuner_set right after a successful tuner_try_claim_fast(),
+     * cleared by channel_scan_thread_main itself right before it releases
+     * the tuner. */
+    bool     scan_worker_active;
+
     /* FIFO of /tunerN/channel SETs that arrived while a previous one's
      * scan thread (control.c's channel_scan_thread_main) is still
      * running on this tuner. Rather than block each request's reply

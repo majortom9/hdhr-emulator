@@ -131,6 +131,8 @@
 #include "udp_stream.h"
 #include "pid_filter.h"
 #include "channel_map.h"
+#include "mpeg_section.h"
+#include "psip.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -818,15 +820,50 @@ static void *channel_scan_thread_main(void *arg)
      * here. */
     tuner_resolve_stale_held_fd(t, ctx->stale_held_fd);
 
+    /* One frontend open for this whole queued-frequency drain, not one
+     * per frequency -- see dvb_scan_tune_and_lock()'s own comment for
+     * why (confirmed live via dmesg: the old per-frequency open/close
+     * triggered a full chip re-init on every single retune, something
+     * the user's own atscdx tool never does across an entire scan).
+     * Safe to hold across every frequency in this loop specifically
+     * because this thread already holds the tuner *claim* across all
+     * of them too (busy stays true until tuner_release() below,
+     * regardless of how many queued frequencies get drained) -- unlike
+     * main.c's startup scan, which deliberately releases the claim
+     * between frequencies and so can't reuse an fd this way either. */
+    int ffd = dvb_frontend_open(t->adapter, ctx->cfg->dvb_frontend);
+    bool have_ffd = (ffd >= 0);
+    if (!have_ffd) {
+        fprintf(stderr, "control: tuner%d/channel: failed to open frontend for scan\n", t->index);
+    }
+
+    /* Same one-open-for-the-whole-batch idea as the frontend fd above,
+     * applied to PAT/VCT's demux filters too -- see
+     * dvb_scan_read_psip()'s own comment for why this is safe (neither
+     * filter's parameters change across this batch) and where the
+     * atscdx comparison that prompted it came from. PMT still opens a
+     * fresh filter per program per frequency (see
+     * read_pmts_concurrent()), since which PIDs it needs varies per
+     * mux. */
+    int pat_fd = have_ffd ? mpeg_section_filter_open(t->adapter, ctx->cfg->dvb_demux,
+                                                       0x0000, 0x00, 2000) : -1;
+    int vct_fd = have_ffd ? mpeg_section_filter_open(t->adapter, ctx->cfg->dvb_demux,
+                                                       PSIP_BASE_PID,
+                                                       ctx->delivery == HDHR_DELIVERY_QAM ? 0xC9 : 0xC8,
+                                                       2000) : -1;
+    bool have_psip_fds = (pat_fd >= 0 && vct_fd >= 0);
+    if (have_ffd && !have_psip_fds) {
+        fprintf(stderr, "control: tuner%d/channel: failed to open PAT/VCT demux filters for scan\n",
+                t->index);
+    }
+
     for (;;) {
         struct timespec attempt_t0;
         clock_gettime(CLOCK_MONOTONIC, &attempt_t0);
 
         struct scan_progress_ctx pc = { .t = t, .freq = freq };
-        int ffd;
-        bool locked = dvb_scan_tune_and_lock(t->adapter, ctx->cfg->dvb_frontend, freq,
-                                              ctx->delivery, &ffd,
-                                              publish_scan_stats, &pc);
+        bool locked = have_ffd && dvb_scan_tune_and_lock(ffd, freq, ctx->delivery,
+                                                           publish_scan_stats, &pc);
         {
             struct timespec t1;
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -850,12 +887,11 @@ static void *channel_scan_thread_main(void *arg)
 
         if (locked) {
             /* Give the legacy uncorrected-blocks counter a real window
-             * to measure before PSIP reading closes this fd.
-             * publish_scan_stats() during the wait-for-lock loop above
-             * only ever gets one sample in the common (fast-locking)
-             * case, since polling stops the instant FE_HAS_LOCK is
-             * detected — not enough for
-             * dvb_frontend_legacy_seq_pct()'s windowed calculation
+             * to measure before PSIP reading. publish_scan_stats()
+             * during the wait-for-lock loop above only ever gets one
+             * sample in the common (fast-locking) case, since polling
+             * stops the instant FE_HAS_LOCK is detected — not enough
+             * for dvb_frontend_legacy_seq_pct()'s windowed calculation
              * (needs >=0.5s between two samples on the same state).
              * Confirmed live: without this, seq= stayed 0 indefinitely
              * even on a strongly-locked channel, since polling simply
@@ -869,8 +905,10 @@ static void *channel_scan_thread_main(void *arg)
 
             struct timespec psip_t0;
             clock_gettime(CLOCK_MONOTONIC, &psip_t0);
-            int n_found = dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, rf_channel, freq,
-                                ctx->delivery, ffd);
+            int n_found = have_psip_fds
+                ? dvb_scan_read_psip(t->adapter, ctx->cfg->dvb_demux, pat_fd, vct_fd,
+                                     rf_channel, freq, ctx->delivery)
+                : 0;
             struct timespec psip_t1;
             clock_gettime(CLOCK_MONOTONIC, &psip_t1);
             long psip_ms = (psip_t1.tv_sec - psip_t0.tv_sec) * 1000L + (psip_t1.tv_nsec - psip_t0.tv_nsec) / 1000000L;
@@ -905,6 +943,15 @@ static void *channel_scan_thread_main(void *arg)
         break;
     }
 
+    /* Must close before tuner_open_hold() below -- it opens its own
+     * fresh fd on this same physical frontend, which can't succeed
+     * while this scan's own fd is still open (see
+     * dvb_scan_tune_and_lock()'s own comment on why this thread gets
+     * to keep one fd open across the whole drain in the first place). */
+    if (have_ffd) dvb_frontend_close(ffd);
+    if (pat_fd >= 0) mpeg_section_filter_close(pat_fd);
+    if (vct_fd >= 0) mpeg_section_filter_close(vct_fd);
+
     /* Engage the physical tuner continuously for whichever frequency
      * this thread last processed, regardless of whether it actually
      * locked -- matching real hardware, which keeps a selected tuner's
@@ -919,6 +966,12 @@ static void *channel_scan_thread_main(void *arg)
      * wasted work. */
     tuner_open_hold(t, freq, ctx->delivery);
 
+    /* Clear before releasing the claim -- see scan_worker_active's own
+     * comment in tuner.h. Nothing can queue behind this thread once
+     * this is false and the claim is about to be free anyway. */
+    tuner_lock(t);
+    t->scan_worker_active = false;
+    tuner_unlock(t);
     tuner_release(t);
     pthread_mutex_destroy(&ctx->mutex);
     pthread_cond_destroy(&ctx->cond);
@@ -1092,7 +1145,19 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
         if (!tuner_try_claim_fast(t, &stale_held_fd)) {
             tuner_lock(t);
             bool has_active_stream = (t->active_stream != NULL);
-            if (!has_active_stream) {
+            /* Only queue if channel_scan_thread_main is the one actually
+             * holding the claim -- it's the sole drainer of pending_queue.
+             * `busy` can also be true because of main.c's one-shot startup
+             * scan (dvb_scan_run-style, talks to the adapter/frontend/demux
+             * directly, no notion of pending_queue at all): queueing there
+             * would silently strand the request forever (see
+             * scan_worker_active's own comment in tuner.h -- confirmed
+             * live: /tunerN/status looked like it worked via
+             * tuner_release()'s unrelated re-hold logic, but
+             * /tunerN/vchannel stayed "none" forever since no real PSIP
+             * scan ever ran). */
+            bool queueable = (!has_active_stream && t->scan_worker_active);
+            if (queueable) {
                 /* Busy because of a previous /tunerN/channel scan still
                  * running on this same tuner — enqueue this frequency
                  * for that worker to drain (see channel_scan_thread_main
@@ -1160,9 +1225,22 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
                 return;
             }
             tuner_unlock(t);
-            fprintf(stderr, "control: tuner%d/channel SET to %s refused — tuner busy streaming\n",
-                             t->index, value);
-            send_error_reply(fd, name, "ERROR: tuner busy (currently streaming)");
+            if (has_active_stream) {
+                fprintf(stderr, "control: tuner%d/channel SET to %s refused — tuner busy streaming\n",
+                                 t->index, value);
+                send_error_reply(fd, name, "ERROR: tuner busy (currently streaming)");
+            } else {
+                /* Busy, but not from a channel_scan_thread_main this
+                 * request could queue behind (see scan_worker_active's
+                 * comment) — almost certainly main.c's one-shot startup
+                 * scan, which holds tuner0's claim for its entire ~1-2
+                 * minute run. Fail fast and clean rather than silently
+                 * stranding the request in a queue nobody drains. */
+                fprintf(stderr, "control: tuner%d/channel SET to %s refused — tuner busy "
+                                 "(one-shot scan in progress, not queueable)\n",
+                                 t->index, value);
+                send_error_reply(fd, name, "ERROR: tuner busy (scan in progress)");
+            }
             return;
         }
 
@@ -1192,6 +1270,11 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
          * as "confirmed no signal" and can make it give up immediately
          * instead of waiting for a genuine result. */
         snprintf(t->status, sizeof(t->status), "ch=%s lock=none ss=45 snq=0 seq=0", t->channel);
+        /* Marks this claim as one channel_scan_thread_main itself owns
+         * and will drain pending_queue for -- see scan_worker_active's
+         * own comment in tuner.h. Cleared by channel_scan_thread_main
+         * right before it releases the tuner. */
+        t->scan_worker_active = true;
         tuner_unlock(t);
 
         struct channel_scan_ctx *ctx = malloc(sizeof(*ctx));
@@ -1218,6 +1301,11 @@ static void handle_tuner_set(int fd, const struct hdhr_config *cfg, struct hdhr_
              * pthread_create()-failed path, not the normal one. */
             tuner_resolve_stale_held_fd(t, stale_held_fd);
             free(ctx);
+            /* channel_scan_thread_main never runs, so it can't clear this
+             * itself -- see scan_worker_active's own comment. */
+            tuner_lock(t);
+            t->scan_worker_active = false;
+            tuner_unlock(t);
             tuner_release(t); /* don't leave the tuner claimed forever if we can't scan */
             send_value_reply(fd, name, t->channel);
             return;

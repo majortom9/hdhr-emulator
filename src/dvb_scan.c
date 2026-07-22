@@ -35,15 +35,19 @@ struct pmt_cache_entry {
     struct pmt_info pmt;
 };
 
-static int read_pat(int adapter, int demux_num, struct pat_entry *out, int max_out)
+/* Takes an already-open, already-armed demux filter fd (PID 0x0000,
+ * table_id 0x00 -- PAT's filter never changes, regardless of
+ * frequency or delivery system) rather than opening/closing one on
+ * every call. Matching atscdx's own structure (its VCT read opens its
+ * one demux fd once, at the very start of the whole scan, not per
+ * channel) -- this project needs PAT+PMT too (atscdx only ever reads
+ * VCT, since it just needs a channel name for a report, not real PIDs
+ * for later playback), but PAT's own filter is just as fixed as VCT's,
+ * so the same reuse applies. */
+static int read_pat(int fd, struct pat_entry *out, int max_out)
 {
-    int fd = mpeg_section_filter_open(adapter, demux_num, 0x0000, 0x00, SECTION_READ_TIMEOUT_MS);
-    if (fd < 0) return -1;
-
     uint8_t buf[4096];
     ssize_t n = mpeg_section_read(fd, buf, sizeof(buf), SECTION_READ_TIMEOUT_MS);
-    mpeg_section_filter_close(fd);
-
     if (n <= 0) return -1;
     return psip_parse_pat(buf, (size_t)n, out, max_out);
 }
@@ -143,11 +147,15 @@ static int read_pmts_concurrent(int adapter, int demux_num,
  * handful of read attempts pass without progress. table_id is 0xC8 for
  * TVCT (terrestrial) or 0xC9 for CVCT (cable) — psip_parse_tvct() parses
  * both identically, they share the same wire format per ATSC A/65. */
-static int read_vct(int adapter, int demux_num, uint8_t table_id, struct tvct_entry *out, int max_out)
+/* Takes an already-open, already-armed demux filter fd (PSIP_BASE_PID,
+ * whichever table_id -- 0xC8/TVCT or 0xC9/CVCT -- matches this whole
+ * scan batch's delivery system, see the caller) instead of opening/
+ * closing one on every call -- see read_pat()'s own comment for why.
+ * table_id stays constant across every frequency a single scan batch
+ * processes (delivery is fixed per channel_scan_ctx/dvb_scan_run
+ * call), so one fd covers the whole batch safely. */
+static int read_vct(int fd, struct tvct_entry *out, int max_out)
 {
-    int fd = mpeg_section_filter_open(adapter, demux_num, PSIP_BASE_PID, table_id, SECTION_READ_TIMEOUT_MS);
-    if (fd < 0) return -1;
-
     bool seen[256] = {false};
     int last_section = -1;
     int total = 0;
@@ -179,33 +187,22 @@ static int read_vct(int adapter, int demux_num, uint8_t table_id, struct tvct_en
         }
     }
 
-    mpeg_section_filter_close(fd);
     return total;
 }
 
-bool dvb_scan_tune_and_lock(int adapter, int frontend, uint32_t freq_hz,
-                             enum hdhr_delivery_system delivery, int *out_ffd,
+bool dvb_scan_tune_and_lock(int ffd, uint32_t freq_hz,
+                             enum hdhr_delivery_system delivery,
                              dvb_frontend_progress_cb progress_cb, void *progress_ctx)
 {
-    *out_ffd = -1;
-
-    int ffd = dvb_frontend_open(adapter, frontend);
-    if (ffd < 0) return false;
-
     int tune_rc = (delivery == HDHR_DELIVERY_QAM)
                   ? dvb_frontend_tune_qam(ffd, freq_hz)
                   : dvb_frontend_tune_8vsb(ffd, freq_hz);
-    if (tune_rc != 0) {
-        dvb_frontend_close(ffd);
-        return false;
-    }
-    if (!dvb_frontend_wait_lock(ffd, LOCK_TIMEOUT_MS, progress_cb, progress_ctx)) {
-        dvb_frontend_close(ffd); /* no signal on this frequency — normal, most will miss */
-        return false;
-    }
+    if (tune_rc != 0) return false;
 
-    *out_ffd = ffd;
-    return true;
+    return dvb_frontend_wait_lock(ffd, LOCK_TIMEOUT_MS, progress_cb, progress_ctx);
+    /* no signal on this frequency — normal, most will miss. Caller owns
+     * ffd either way now (see this function's own header comment for
+     * why) -- doesn't close it here regardless of outcome. */
 }
 
 /* Fallback for HDHR_DELIVERY_QAM muxes with no usable CVCT: exposes
@@ -259,17 +256,29 @@ static int add_channels_without_vct(int rf_channel, uint32_t freq_hz,
     return added;
 }
 
-int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq_hz,
-                        enum hdhr_delivery_system delivery, int ffd)
+int dvb_scan_read_psip(int adapter, int demux_num, int pat_fd, int vct_fd,
+                        int rf_channel, uint32_t freq_hz,
+                        enum hdhr_delivery_system delivery)
 {
     fprintf(stderr, "dvb_scan: locked %u Hz, reading PAT/PMT/%s...\n", freq_hz,
             delivery == HDHR_DELIVERY_QAM ? "CVCT" : "TVCT");
 
+    /* Re-arm both reused filters for this frequency before reading --
+     * without this, stale sections buffered under the *previous* tune
+     * can still be sitting in the kernel's demux ring and get delivered
+     * here instead of this frequency's real data (see
+     * mpeg_section_filter_rearm()'s own comment; confirmed live via a
+     * scan reporting one frequency's TSID/programs bleeding into the
+     * next). */
+    mpeg_section_filter_rearm(pat_fd, 0x0000, 0x00, SECTION_READ_TIMEOUT_MS);
+    mpeg_section_filter_rearm(vct_fd, PSIP_BASE_PID,
+                               delivery == HDHR_DELIVERY_QAM ? 0xC9 : 0xC8,
+                               SECTION_READ_TIMEOUT_MS);
+
     struct pat_entry pat[PAT_MAX_ENTRIES];
-    int pat_count = read_pat(adapter, demux_num, pat, PAT_MAX_ENTRIES);
+    int pat_count = read_pat(pat_fd, pat, PAT_MAX_ENTRIES);
     if (pat_count <= 0) {
         fprintf(stderr, "dvb_scan: %u Hz locked but no PAT — skipping\n", freq_hz);
-        dvb_frontend_close(ffd);
         return 0;
     }
 
@@ -277,11 +286,8 @@ int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq
     int pmt_cache_count = read_pmts_concurrent(adapter, demux_num, pat, pat_count,
                                                  pmt_cache, PMT_MAX_PROGRAMS_TEMP);
 
-    uint8_t vct_table_id = (delivery == HDHR_DELIVERY_QAM) ? 0xC9 : 0xC8;
     struct tvct_entry tvct[TVCT_MAX_CHANNELS];
-    int tvct_count = read_vct(adapter, demux_num, vct_table_id, tvct, TVCT_MAX_CHANNELS);
-
-    dvb_frontend_close(ffd);
+    int tvct_count = read_vct(vct_fd, tvct, TVCT_MAX_CHANNELS);
 
     if (tvct_count <= 0) {
         if (delivery == HDHR_DELIVERY_QAM && pmt_cache_count > 0) {
@@ -376,17 +382,32 @@ int dvb_scan_run(int adapter, int frontend, int demux_num)
     dvb_channel_db_clear();
     fprintf(stderr, "dvb_scan: starting full scan on adapter%d (this takes a couple minutes)\n", adapter);
 
+    /* One frontend open for the whole scan, not one per frequency --
+     * see dvb_scan_tune_and_lock()'s own header comment for why. Same
+     * idea for PAT/VCT's demux filters -- see dvb_scan_read_psip()'s
+     * own comment. */
+    int ffd = dvb_frontend_open(adapter, frontend);
+    if (ffd < 0) return 0;
+
+    int pat_fd = mpeg_section_filter_open(adapter, demux_num, 0x0000, 0x00, SECTION_READ_TIMEOUT_MS);
+    int vct_fd = mpeg_section_filter_open(adapter, demux_num, PSIP_BASE_PID, 0xC8, SECTION_READ_TIMEOUT_MS);
+
     int total = 0;
-    for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
-        int ffd;
-        if (dvb_scan_tune_and_lock(adapter, frontend, atsc_freq_table[i].frequency_hz,
-                                    HDHR_DELIVERY_ATSC_VSB, &ffd, NULL, NULL)) {
-            total += dvb_scan_read_psip(adapter, demux_num, atsc_freq_table[i].channel,
-                                         atsc_freq_table[i].frequency_hz,
-                                         HDHR_DELIVERY_ATSC_VSB, ffd);
+    if (pat_fd >= 0 && vct_fd >= 0) {
+        for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
+            if (dvb_scan_tune_and_lock(ffd, atsc_freq_table[i].frequency_hz,
+                                        HDHR_DELIVERY_ATSC_VSB, NULL, NULL)) {
+                total += dvb_scan_read_psip(adapter, demux_num, pat_fd, vct_fd,
+                                             atsc_freq_table[i].channel,
+                                             atsc_freq_table[i].frequency_hz,
+                                             HDHR_DELIVERY_ATSC_VSB);
+            }
         }
     }
 
+    if (pat_fd >= 0) mpeg_section_filter_close(pat_fd);
+    if (vct_fd >= 0) mpeg_section_filter_close(vct_fd);
+    dvb_frontend_close(ffd);
     fprintf(stderr, "dvb_scan: complete — %d virtual channel(s) found\n", total);
     return total;
 }

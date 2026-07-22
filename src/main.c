@@ -32,6 +32,8 @@
 #include "dvb_frontend.h"
 #include "dvb_channel.h"
 #include "atsc_freq.h"
+#include "mpeg_section.h"
+#include "psip.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,23 +57,27 @@ static struct hdhr_tuner  g_tuners[HDHR_MAX_TUNERS];
  * — one physical tuner briefly does the scanning work for the whole
  * box, since the channel database is shared across all tuner slots.
  *
- * Claims tuner0 per frequency (tuner_try_claim_wait, not
- * tuner_try_claim), rather than once for the whole scan, so tuner0
- * isn't a several-minutes-long dead zone for every other consumer of a
- * physical tuner (HTTP pulls, target= pushes, a manual /tunerN/channel
- * SET) right after every restart. An earlier version claimed once up
- * front for the entire dvb_scan_run() call: correct in that it did
- * prevent the startup scan and, say, a `hdhomerun_config ... scan
- * /tuner0` issued right after restart from touching the same physical
- * frontend device concurrently (dvb_scan_tune_and_lock/read_psip bypass
- * the tuner abstraction entirely — they drive the adapter/frontend/demux
- * numbers directly, so an uncoordinated collision there surfaces as a
- * raw "Device or resource busy" from the kernel, not a clean "tuner
- * busy" reply) — but holding the claim for the whole scan meant a
- * request landing mid-scan could queue long enough for the client's own
- * timeout to give up with a hard communication error before ever
- * reaching that clean reply. Releasing between frequencies bounds the
- * wait to one step instead. */
+ * Claims tuner0 ONCE for the entire scan and holds the frontend/PAT/VCT
+ * fds open the whole time, retuning in place -- matching every
+ * reference scanning tool checked against (dvbv5-scan and atscdx, both
+ * libdvbv5-based, and w_scan2/scan-s2, which uses raw ioctls like this
+ * project does): all three open their frontend once before the scan
+ * loop and only close it after the last frequency. An earlier version
+ * of this function released the claim between every frequency instead,
+ * on the theory that it gave another consumer (an HTTP pull, a manual
+ * /tunerN/channel SET) a periodic window to grab tuner0 during the
+ * scan rather than being locked out for its full ~1-2 minutes. That
+ * turned out not to deliver what it promised: a DVB frontend device
+ * can only have one open fd at all, at the kernel level, regardless of
+ * our own claim bookkeeping -- so a waiting consumer could only ever
+ * actually succeed in the brief instant our fd was genuinely closed
+ * between frequencies, not just whenever the claim flag said "free".
+ * Paying a full close+reopen (and the chip re-init that goes with it,
+ * confirmed live via dmesg: lgdt3306a_init/si2157_init on nearly every
+ * retune) per frequency for a narrow, mostly-illusory window wasn't
+ * worth it. Now tuner0 is genuinely unavailable to other consumers for
+ * the whole scan, same as it would be on any of the reference tools
+ * above -- they simply accept that as normal for a dedicated scan. */
 static void *scan_thread_main(void *arg)
 {
     (void)arg;
@@ -80,23 +86,36 @@ static void *scan_thread_main(void *arg)
              g_cfg.dvb_adapter[0]);
 
     int total = 0;
-    for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
-        if (!tuner_try_claim_wait(&g_tuners[0], SCAN_STEP_CLAIM_WAIT_MS, 0, HDHR_DELIVERY_ATSC_VSB, NULL)) {
-            fprintf(stderr, "dvb_scan: tuner0 busy, skipping %u Hz this pass\n",
-                    atsc_freq_table[i].frequency_hz);
-            continue;
-        }
-        int ffd;
-        if (dvb_scan_tune_and_lock(g_cfg.dvb_adapter[0], g_cfg.dvb_frontend,
-                                    atsc_freq_table[i].frequency_hz,
-                                    HDHR_DELIVERY_ATSC_VSB, &ffd, NULL, NULL)) {
-            total += dvb_scan_read_psip(g_cfg.dvb_adapter[0], g_cfg.dvb_demux,
-                                         atsc_freq_table[i].channel,
-                                         atsc_freq_table[i].frequency_hz,
-                                         HDHR_DELIVERY_ATSC_VSB, ffd);
-        }
-        tuner_release(&g_tuners[0]);
+    if (!tuner_try_claim_wait(&g_tuners[0], SCAN_STEP_CLAIM_WAIT_MS, 0, HDHR_DELIVERY_ATSC_VSB, NULL)) {
+        fprintf(stderr, "dvb_scan: tuner0 busy, skipping startup scan entirely\n");
+        return NULL;
     }
+
+    int ffd = dvb_frontend_open(g_cfg.dvb_adapter[0], g_cfg.dvb_frontend);
+    int pat_fd = (ffd >= 0) ? mpeg_section_filter_open(g_cfg.dvb_adapter[0], g_cfg.dvb_demux,
+                                                         0x0000, 0x00, 2000) : -1;
+    int vct_fd = (ffd >= 0) ? mpeg_section_filter_open(g_cfg.dvb_adapter[0], g_cfg.dvb_demux,
+                                                         PSIP_BASE_PID, 0xC8, 2000) : -1;
+
+    if (ffd >= 0 && pat_fd >= 0 && vct_fd >= 0) {
+        for (int i = 0; i < ATSC_FREQ_TABLE_COUNT; i++) {
+            if (dvb_scan_tune_and_lock(ffd, atsc_freq_table[i].frequency_hz,
+                                        HDHR_DELIVERY_ATSC_VSB, NULL, NULL)) {
+                total += dvb_scan_read_psip(g_cfg.dvb_adapter[0], g_cfg.dvb_demux,
+                                             pat_fd, vct_fd,
+                                             atsc_freq_table[i].channel,
+                                             atsc_freq_table[i].frequency_hz,
+                                             HDHR_DELIVERY_ATSC_VSB);
+            }
+        }
+    } else {
+        fprintf(stderr, "dvb_scan: failed to open frontend/demux for startup scan\n");
+    }
+
+    if (pat_fd >= 0) mpeg_section_filter_close(pat_fd);
+    if (vct_fd >= 0) mpeg_section_filter_close(vct_fd);
+    if (ffd >= 0) dvb_frontend_close(ffd);
+    tuner_release(&g_tuners[0]);
 
     fprintf(stderr, "dvb_scan: complete — %d virtual channel(s) found\n", total);
     return NULL;

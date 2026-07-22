@@ -38,6 +38,24 @@ int mpeg_section_filter_open(int adapter, int demux_num, uint16_t pid,
     return fd;
 }
 
+int mpeg_section_filter_rearm(int fd, uint16_t pid, uint8_t table_id, uint32_t timeout_ms)
+{
+    struct dmx_sct_filter_params params;
+    memset(&params, 0, sizeof(params));
+    params.pid = pid;
+    params.filter.filter[0] = table_id;
+    params.filter.mask[0] = 0xFF;
+    params.timeout = timeout_ms;
+    params.flags = DMX_CHECK_CRC | DMX_IMMEDIATE_START;
+
+    if (ioctl(fd, DMX_SET_FILTER, &params) < 0) {
+        fprintf(stderr, "mpeg_section: rearm DMX_SET_FILTER (pid=0x%04X table_id=0x%02X) "
+                         "failed: %s\n", pid, table_id, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 ssize_t mpeg_section_read(int fd, uint8_t *buf, size_t bufsize, int timeout_ms)
 {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };

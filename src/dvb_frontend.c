@@ -19,9 +19,25 @@ int dvb_frontend_open(int adapter, int frontend)
 {
     char path[64];
     snprintf(path, sizeof(path), "/dev/dvb/adapter%d/frontend%d", adapter, frontend);
-    /* O_RDWR: tuning requires write access; nonblock so wait_lock can poll
-     * status itself rather than blocking inside the kernel driver. */
-    int fd = open(path, O_RDWR | O_NONBLOCK);
+    /* O_RDWR only -- no O_NONBLOCK (this function used to always add
+     * it, on the assumption that it let dvb_frontend_wait_lock() poll
+     * status itself rather than blocking inside the kernel driver).
+     * Reading libdvbv5's own dvb_local_open() (lib/libdvbv5/
+     * dvb-dev-local.c, source read directly) turned up an explicit,
+     * deliberate opposite choice: it always clears O_NONBLOCK for a
+     * real frontend device, only ever setting it as a special-case
+     * workaround for "dvbloopback" (a virtual test driver), with this
+     * comment attached: "The frontend API was designed for sync
+     * frontend access. It is not ready to handle async frontend
+     * access." Confirmed live (2026-07-21) that this daemon's own
+     * scans, even after removing DTV_CLEAR and reusing the frontend fd
+     * across a whole scan (two separate, otherwise-reasonable changes
+     * that turned out not to touch this), still triggered a full
+     * lgdt3306a_init/si2157_init chip re-init on essentially every
+     * single retune (35 inits across a 35-frequency scan) -- while
+     * atscdx (via libdvbv5, real-hardware-mode blocking open) showed
+     * zero re-inits across an entire scan. Matching that exactly. */
+    int fd = open(path, O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "dvb_frontend: open %s failed: %s\n", path, strerror(errno));
     }
@@ -35,36 +51,44 @@ void dvb_frontend_close(int fd)
 
 int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
 {
-    /* DTV_TUNE bundled into the SAME ioctl call as DTV_CLEAR/DELIVERY_
-     * SYSTEM/MODULATION/FREQUENCY, not a separate FE_SET_PROPERTY call
+    /* DTV_TUNE bundled into the SAME ioctl call as DELIVERY_SYSTEM/
+     * MODULATION/FREQUENCY, not a separate FE_SET_PROPERTY call
      * afterward (this function used to issue two) -- matching
      * libdvbv5's own __dvb_fe_set_parms() (lib/libdvbv5/dvb-fe.c,
      * source read directly), which always appends DTV_TUNE onto the
-     * same properties array as one atomic commit. Splitting it into
-     * two separate ioctls left a real window between "properties set"
-     * and "tune committed" where this hardware could apparently get
-     * confused: confirmed live via dmesg (2026-07-21) that a scan could
-     * hit a long run of consecutive lgdt3306a_init/si2157_init pairs
-     * with no lgdt3306a_search ever following -- i.e. the demod/tuner
-     * chips kept re-initializing without ever reaching the actual
-     * lock-search phase -- right where a scan started silently missing
-     * channels with otherwise-solid confirmed signal (509/503MHz among
-     * them). atscdx (via libdvbv5) doesn't split the ioctl and doesn't
-     * exhibit this. */
-    struct dtv_property props[5];
+     * same properties array as one atomic commit.
+     *
+     * No DTV_CLEAR either (this function used to send it first, every
+     * call) -- libdvbv5's own tune path (same function) never sends it
+     * at all, on any call, for any delivery system. Per the kernel
+     * DVBv5 API docs, DTV_CLEAR means "reset to the initial state,
+     * discarding any partial tuning session" -- a deliberate full
+     * reset, not something a plain retune needs. Confirmed live via
+     * dmesg (2026-07-21): this daemon's own scans were triggering a
+     * full lgdt3306a_init/si2157_init chip re-init on nearly every
+     * single retune (~1 per frequency, continuing throughout an entire
+     * scan), while atscdx's own scan showed zero re-inits after its
+     * first tune, only lgdt3306a_search. Reusing the frontend fd across
+     * a whole scan (a separate, already-applied change) didn't fix
+     * this on its own -- the re-init kept happening even on an
+     * already-open fd -- which is what pointed at DTV_CLEAR itself as
+     * the actual trigger rather than the open() call. Every property
+     * this delivery system needs is still set explicitly on every
+     * call, so there's nothing left over from a previous tune for
+     * DTV_CLEAR to have been protecting against here. */
+    struct dtv_property props[4];
     memset(props, 0, sizeof(props));
 
-    props[0].cmd = DTV_CLEAR;
-    props[1].cmd = DTV_DELIVERY_SYSTEM;
-    props[1].u.data = SYS_ATSC;
-    props[2].cmd = DTV_MODULATION;
-    props[2].u.data = VSB_8;
-    props[3].cmd = DTV_FREQUENCY;
-    props[3].u.data = frequency_hz;
-    props[4].cmd = DTV_TUNE;
+    props[0].cmd = DTV_DELIVERY_SYSTEM;
+    props[0].u.data = SYS_ATSC;
+    props[1].cmd = DTV_MODULATION;
+    props[1].u.data = VSB_8;
+    props[2].cmd = DTV_FREQUENCY;
+    props[2].u.data = frequency_hz;
+    props[3].cmd = DTV_TUNE;
 
-    struct dtv_properties clear_and_tune = { .num = 5, .props = props };
-    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_tune) < 0) {
+    struct dtv_properties tune = { .num = 4, .props = props };
+    if (ioctl(fd, FE_SET_PROPERTY, &tune) < 0) {
         fprintf(stderr, "dvb_frontend: FE_SET_PROPERTY (freq=%u) failed: %s\n",
                 frequency_hz, strerror(errno));
         return -1;
@@ -97,25 +121,25 @@ int dvb_frontend_tune_8vsb(int fd, uint32_t frequency_hz)
 
 int dvb_frontend_tune_qam(int fd, uint32_t frequency_hz)
 {
-    /* DTV_TUNE bundled into the same ioctl call as the other properties
-     * -- see dvb_frontend_tune_8vsb()'s comment for why (this used to
-     * be two separate FE_SET_PROPERTY calls here too). */
-    struct dtv_property props[6];
+    /* DTV_TUNE bundled into the same ioctl call as the other properties,
+     * and no DTV_CLEAR -- see dvb_frontend_tune_8vsb()'s comment for
+     * why (this used to send DTV_CLEAR and issue DTV_TUNE separately
+     * here too). */
+    struct dtv_property props[5];
     memset(props, 0, sizeof(props));
 
-    props[0].cmd = DTV_CLEAR;
-    props[1].cmd = DTV_DELIVERY_SYSTEM;
-    props[1].u.data = SYS_DVBC_ANNEX_B;
-    props[2].cmd = DTV_MODULATION;
-    props[2].u.data = QAM_AUTO;
-    props[3].cmd = DTV_SYMBOL_RATE;
-    props[3].u.data = HDHR_QAM_SYMBOL_RATE;
-    props[4].cmd = DTV_FREQUENCY;
-    props[4].u.data = frequency_hz;
-    props[5].cmd = DTV_TUNE;
+    props[0].cmd = DTV_DELIVERY_SYSTEM;
+    props[0].u.data = SYS_DVBC_ANNEX_B;
+    props[1].cmd = DTV_MODULATION;
+    props[1].u.data = QAM_AUTO;
+    props[2].cmd = DTV_SYMBOL_RATE;
+    props[2].u.data = HDHR_QAM_SYMBOL_RATE;
+    props[3].cmd = DTV_FREQUENCY;
+    props[3].u.data = frequency_hz;
+    props[4].cmd = DTV_TUNE;
 
-    struct dtv_properties clear_and_tune = { .num = 6, .props = props };
-    if (ioctl(fd, FE_SET_PROPERTY, &clear_and_tune) < 0) {
+    struct dtv_properties tune = { .num = 5, .props = props };
+    if (ioctl(fd, FE_SET_PROPERTY, &tune) < 0) {
         fprintf(stderr, "dvb_frontend: FE_SET_PROPERTY QAM (freq=%u) failed: %s\n",
                 frequency_hz, strerror(errno));
         return -1;
