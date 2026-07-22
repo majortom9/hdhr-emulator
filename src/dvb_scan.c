@@ -12,6 +12,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <poll.h>
+#include <time.h>
 
 /* Was 1500ms. Tried 300ms (matching atscdx's own ~150-200ms patience)
  * to dodge this hardware's confirmed occasional multi-second stall
@@ -45,17 +48,93 @@ static int read_pat(int adapter, int demux_num, struct pat_entry *out, int max_o
     return psip_parse_pat(buf, (size_t)n, out, max_out);
 }
 
-static bool read_pmt(int adapter, int demux_num, uint16_t pmt_pid, struct pmt_info *out)
+/* Reads every program's PMT concurrently instead of one at a time --
+ * each lives on its own PID, so the demux hardware can filter all of
+ * them at once, but reading them sequentially (each with its own
+ * SECTION_READ_TIMEOUT_MS budget via read_pmt()'s old single-fd form)
+ * meant a mux with many subchannels paid that cost once per program.
+ * Confirmed live (2026-07-21): a 9-program mux's PMT reads alone took
+ * ~2.8s total sequentially -- a real contributor to the client racing
+ * ahead of our own worker while it's still busy (see
+ * channel_scan_thread_main's own comment in control.c). Opens one
+ * filter per program up front, then poll()s all of them together
+ * until every one has produced a section or a shared timeout budget
+ * (not per-program) runs out -- total wall-clock cost becomes close to
+ * the single slowest PMT, not the sum of all of them. */
+static int read_pmts_concurrent(int adapter, int demux_num,
+                                  const struct pat_entry *pat, int pat_count,
+                                  struct pmt_cache_entry *pmt_cache, int max_cache)
 {
-    int fd = mpeg_section_filter_open(adapter, demux_num, pmt_pid, 0x02, SECTION_READ_TIMEOUT_MS);
-    if (fd < 0) return false;
+    int n = pat_count;
+    if (n > PMT_MAX_PROGRAMS_TEMP) n = PMT_MAX_PROGRAMS_TEMP;
 
-    uint8_t buf[4096];
-    ssize_t n = mpeg_section_read(fd, buf, sizeof(buf), SECTION_READ_TIMEOUT_MS);
-    mpeg_section_filter_close(fd);
+    int fds[PMT_MAX_PROGRAMS_TEMP];
+    int pat_idx[PMT_MAX_PROGRAMS_TEMP]; /* which pat[] entry each fds[] slot belongs to */
+    bool done[PMT_MAX_PROGRAMS_TEMP];
+    int nfds = 0;
 
-    if (n <= 0) return false;
-    return psip_parse_pmt(buf, (size_t)n, out) >= 0;
+    for (int i = 0; i < n; i++) {
+        int fd = mpeg_section_filter_open(adapter, demux_num, pat[i].pmt_pid, 0x02, SECTION_READ_TIMEOUT_MS);
+        if (fd < 0) continue;
+        fds[nfds] = fd;
+        pat_idx[nfds] = i;
+        done[nfds] = false;
+        nfds++;
+    }
+
+    int cache_count = 0;
+    int remaining = nfds;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (remaining > 0) {
+        struct pollfd pfds[PMT_MAX_PROGRAMS_TEMP];
+        int slot_of[PMT_MAX_PROGRAMS_TEMP];
+        int np = 0;
+        for (int k = 0; k < nfds; k++) {
+            if (done[k]) continue;
+            pfds[np].fd = fds[k];
+            pfds[np].events = POLLIN;
+            pfds[np].revents = 0;
+            slot_of[np] = k;
+            np++;
+        }
+        if (np == 0) break;
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        long remaining_ms = SECTION_READ_TIMEOUT_MS - elapsed_ms;
+        if (remaining_ms <= 0) break;
+
+        int pr = poll(pfds, (nfds_t)np, (int)remaining_ms);
+        if (pr <= 0) break; /* shared budget exhausted, or a real poll error --
+                              * either way, whatever hasn't answered yet never will in time */
+
+        for (int j = 0; j < np; j++) {
+            if (!(pfds[j].revents & POLLIN)) continue;
+            int slot = slot_of[j];
+            done[slot] = true;
+            remaining--;
+
+            uint8_t buf[4096];
+            ssize_t rn = read(fds[slot], buf, sizeof(buf));
+            if (rn < 0) {
+                continue; /* EOVERFLOW or a real error -- treat as a miss, same as mpeg_section_read() does */
+            }
+            struct pmt_info pmt;
+            if (psip_parse_pmt(buf, (size_t)rn, &pmt) >= 0 && cache_count < max_cache) {
+                pmt_cache[cache_count].program_number = pat[pat_idx[slot]].program_number;
+                pmt_cache[cache_count].pmt = pmt;
+                cache_count++;
+            }
+        }
+    }
+
+    for (int k = 0; k < nfds; k++) {
+        mpeg_section_filter_close(fds[k]);
+    }
+    return cache_count;
 }
 
 /* Reads TVCT/CVCT sections until every section_number 0..last_section_number
@@ -195,15 +274,8 @@ int dvb_scan_read_psip(int adapter, int demux_num, int rf_channel, uint32_t freq
     }
 
     struct pmt_cache_entry pmt_cache[PMT_MAX_PROGRAMS_TEMP];
-    int pmt_cache_count = 0;
-    for (int i = 0; i < pat_count && pmt_cache_count < PMT_MAX_PROGRAMS_TEMP; i++) {
-        struct pmt_info pmt;
-        if (read_pmt(adapter, demux_num, pat[i].pmt_pid, &pmt)) {
-            pmt_cache[pmt_cache_count].program_number = pat[i].program_number;
-            pmt_cache[pmt_cache_count].pmt = pmt;
-            pmt_cache_count++;
-        }
-    }
+    int pmt_cache_count = read_pmts_concurrent(adapter, demux_num, pat, pat_count,
+                                                 pmt_cache, PMT_MAX_PROGRAMS_TEMP);
 
     uint8_t vct_table_id = (delivery == HDHR_DELIVERY_QAM) ? 0xC9 : 0xC8;
     struct tvct_entry tvct[TVCT_MAX_CHANNELS];
