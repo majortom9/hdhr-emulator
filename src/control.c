@@ -141,6 +141,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <ctype.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -622,6 +623,36 @@ static enum hdhr_delivery_system delivery_for_map(const char *map_name)
 static bool parse_channel_value(const char *channelmap, const char *value,
                                  uint32_t *out_freq, int *out_rf_channel)
 {
+    /* "auto<N>t:<freq_hz>" -- e.g. "auto6t:605028615" -- is tvheadend's
+     * own tvhdhomerun input's tune string for ATSC-T/VSB_8 (confirmed by
+     * reading tvhdhomerun_frontend.c's tvhdhomerun_frontend_tune()
+     * directly: DVB_TYPE_ATSC_T + DVB_MOD_VSB_8 always builds
+     * "auto6t:%u", the "6" being ATSC's fixed 6MHz channel bandwidth,
+     * mirroring the same "auto<bandwidth>t:" pattern it also uses for
+     * DVB-T's own variable bandwidth). Confirmed live (2026-07-22): a
+     * real tvheadend instance configured against this daemon as an
+     * HDHomeRun ATSC source sent exactly this, and this project's
+     * parser didn't recognize the digit+"t" between "auto" and the
+     * colon at all, falling through to the generic "<mapname>:N" path
+     * and failing instantly (resolve_channel_in_map("auto6t", ...)
+     * never matches a real map name) -- tvheadend logged a "failed to
+     * tune" within 18ms, far too fast to be a genuine attempt. Always
+     * an explicit Hz frequency here, same as "8vsb:"/"qam:" below --
+     * no channel-number ambiguity to resolve, since a real client
+     * constructing this form always has an exact frequency in hand
+     * already. The bandwidth digit itself is ignored -- this project
+     * has no variable-bandwidth delivery system to apply it to. */
+    if (strncmp(value, "auto", 4) == 0 && isdigit((unsigned char)value[4])) {
+        const char *p = value + 4;
+        while (isdigit((unsigned char)*p)) p++;
+        if (p[0] == 't' && p[1] == ':') {
+            uint32_t freq = (uint32_t)strtoul(p + 2, NULL, 10);
+            if (freq == 0) return false;
+            *out_freq = freq;
+            *out_rf_channel = reverse_resolve_freq_in_map(channelmap, freq);
+            return true;
+        }
+    }
     if (strncmp(value, "auto:", 5) == 0) {
         uint32_t n = (uint32_t)strtoul(value + 5, NULL, 10);
         if (n == 0) return false;
@@ -998,13 +1029,20 @@ static void *channel_scan_thread_main(void *arg)
                 deadline.tv_sec += 1;
                 deadline.tv_nsec -= 1000000000L;
             }
-            while (t->pending_count == 0) {
+            while (t->pending_count == 0 && t->claim_waiters == 0) {
                 if (pthread_cond_timedwait(&t->pending_cond, &t->lock, &deadline) == ETIMEDOUT) {
                     break; /* recheck pending_count below rather than trusting the return
                             * code alone -- same reasoning as tuner_try_claim_wait's own
                             * timedwait loop */
                 }
             }
+            /* claim_waiters > 0 means someone (e.g. udp_stream.c's
+             * target= push) is actually blocked right now wanting this
+             * tuner -- see claim_waiters' own comment in tuner.h. Don't
+             * make them sit through the rest of this speculative wait
+             * for a next scan frequency that may never come; fall
+             * through to the pending_count check below (still 0) and
+             * release immediately instead. */
         }
         if (t->pending_count > 0) {
             freq = t->pending_queue[t->pending_head].freq;

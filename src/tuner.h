@@ -334,6 +334,25 @@ struct hdhr_tuner {
      * error. */
     pthread_cond_t pending_cond;
 
+    /* Count of callers currently blocked inside tuner_try_claim_wait()
+     * for this tuner (see tuner.c) -- incremented/decremented there,
+     * under `lock`, alongside a pending_cond broadcast so
+     * channel_scan_thread_main's own idle-wait (control.c, guarding
+     * PENDING_WAIT_MS above) notices immediately rather than only on
+     * its next timeout tick. That idle-wait exists purely to keep a
+     * frontend fd open across a *hypothetical* next queued scan
+     * frequency (see pending_cond's own comment) -- once something else
+     * is actually waiting to claim the tuner right now (confirmed live,
+     * 2026-07-22: tvheadend's target= push, which fires within a couple
+     * milliseconds of its own /tunerN/channel SET's reply, immediately
+     * after the worker finishes this frequency's PSIP read), there's no
+     * reason to keep speculatively holding on for a frequency that may
+     * never come — this lets the worker cut that wait short and release
+     * right away instead of making the real, present waiter sit through
+     * up to the full PENDING_WAIT_MS on top of whatever it's already
+     * budgeted for its own wait. Guarded by `lock`. */
+    int claim_waiters;
+
     /* set by udp_stream.c while a target= push is active, so control.c
      * knows whether to stop a previous push before starting a new one */
     volatile int udp_push_active;

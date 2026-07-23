@@ -203,6 +203,13 @@ bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_fr
     }
 
     tuner_lock(t);
+    /* Announce ourselves before waiting -- see claim_waiters' own
+     * comment in tuner.h. Broadcast (not signal) on pending_cond since
+     * channel_scan_thread_main's idle-wait is the one thing listening
+     * for this specifically; a plain busy-release still wakes us via
+     * free_cond below, this is purely the early-cutover signal. */
+    t->claim_waiters++;
+    pthread_cond_broadcast(&t->pending_cond);
     while (t->busy) {
         if (pthread_cond_timedwait(&t->free_cond, &t->lock, &deadline) == ETIMEDOUT) {
             break; /* recheck t->busy below rather than trusting the return code alone —
@@ -210,6 +217,7 @@ bool tuner_try_claim_wait(struct hdhr_tuner *t, int timeout_ms, uint32_t want_fr
                      * could've freed on the very same tick as the timeout */
         }
     }
+    t->claim_waiters--;
     if (t->busy) {
         tuner_unlock(t);
         return false;
