@@ -54,4 +54,24 @@ const struct dvb_channel *dvb_find_channel(int major, int minor);
  * without a fresh scan). Returns the count written (capped at max_out). */
 int dvb_channels_on_freq(uint32_t frequency_hz, const struct dvb_channel **out, int max_out);
 
+/* Persists the current channel db to a plain-text cache file (one line
+ * per channel, all fields the daemon actually needs to stream that
+ * channel again -- unlike lineup.json, which only has GuideNumber/
+ * GuideName/URL and can't reconstruct a tunable dvb_channel). Used so a
+ * restart can serve a known-good lineup immediately instead of the
+ * usual empty-until-first-scan-completes window; see dvb_channel_db_load().
+ * Overwrites path unconditionally. Returns false on any I/O error (path
+ * empty/NULL is treated as "caching disabled", not an error). */
+bool dvb_channel_db_save(const char *path);
+
+/* Loads a cache file written by dvb_channel_db_save(), upserting each
+ * entry via dvb_channel_db_add() (so calling this into a non-empty db
+ * updates in place rather than duplicating). Meant to be called once at
+ * startup, before the background full scan begins -- the scan will
+ * overwrite stale entries and drop ones that no longer exist once it
+ * completes. Missing file or empty/NULL path is not an error (nothing to
+ * load yet, e.g. first-ever run). Returns the number of channels loaded,
+ * or -1 on a malformed file. */
+int dvb_channel_db_load(const char *path);
+
 #endif /* HDHR_DVB_CHANNEL_H */

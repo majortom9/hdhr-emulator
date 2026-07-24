@@ -46,10 +46,21 @@ dvb_demux=0
 # other tuner slot shares. Discovery/control/HTTP come up immediately
 # regardless — the scan runs in the background, so clients that poll
 # lineup.json right after startup will just see an empty (or partial)
-# lineup until it finishes. Disabling this currently means an empty
-# lineup until next restart — there's no runtime "trigger a rescan"
-# control yet.
+# lineup until it finishes (unless channel_cache_file below is set, in
+# which case the last-saved lineup loads immediately instead). To
+# rescan at runtime without restarting, just walk the channel map from
+# a client, e.g. `hdhomerun_config <deviceid> scan <tuner> <output>` —
+# the daemon updates the live channel database (and lineup.json) as
+# each frequency locks, without needing a dedicated "rescan" verb.
 scan_on_startup=1
+
+# Optional path to a cache file the daemon saves its channel list to
+# after every scan (startup or a manual one triggered as described
+# above), and reloads from at the next startup — so lineup.json/
+# streaming work immediately from the last-known lineup instead of
+# sitting empty until scan_on_startup's background scan finishes.
+# Leave unset to disable caching entirely.
+#channel_cache_file=/var/lib/hdhr-emulator/channels.cache
 
 # When trying to calibrate signal_strength_pct ("ss=") against a real
 # HDHomeRun's readings, set this to 1 and watch stderr — logs the raw

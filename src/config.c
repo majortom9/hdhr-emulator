@@ -96,6 +96,8 @@ int config_load(const char *path, struct hdhr_config *cfg)
             cfg->debug_signal_stats = (atoi(val) != 0);
         } else if (strcmp(key, "allow_remote_restart") == 0) {
             cfg->allow_remote_restart = (atoi(val) != 0);
+        } else if (strcmp(key, "channel_cache_file") == 0) {
+            snprintf(cfg->channel_cache_file, sizeof(cfg->channel_cache_file), "%s", val);
         } else if (strncmp(key, "tuner", 5) == 0 && strstr(key, "_adapter") != NULL) {
             /* tunerN_adapter=X — override which /dev/dvb/adapterX a given
              * hdhr_tuner slot maps to, for boxes where tuners aren't

@@ -26,6 +26,15 @@ struct hdhr_config {
     bool     scan_on_startup;       /* default true */
     bool     debug_signal_stats;    /* default false — see dvb_frontend.h */
     bool     allow_remote_restart;  /* default false — see control.c's /sys/restart handler */
+
+    /* Path to a channel cache file (see dvb_channel_db_save/_load) —
+     * loaded at startup so lineup.json/streaming work immediately from
+     * the last-known channel list instead of sitting empty until
+     * scan_on_startup's background scan completes; saved after every
+     * scan (startup or a CLI-driven `hdhomerun_config scan`) so it
+     * stays current. Empty string (the default) disables caching
+     * entirely — nothing is loaded or written. */
+    char     channel_cache_file[256];
 };
 
 void config_defaults(struct hdhr_config *cfg);

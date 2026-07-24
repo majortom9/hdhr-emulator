@@ -1059,6 +1059,13 @@ static void *channel_scan_thread_main(void *arg)
     if (pat_fd >= 0) mpeg_section_filter_close(pat_fd);
     if (vct_fd >= 0) mpeg_section_filter_close(vct_fd);
 
+    /* Once per drained batch (not per frequency) -- a CLI-driven
+     * `hdhomerun_config scan` can walk dozens of queued frequencies in
+     * a couple seconds, and this is the same channel db main.c's
+     * startup scan also saves to, so a manual rescan's new/updated
+     * channels persist across the next restart too. */
+    dvb_channel_db_save(ctx->cfg->channel_cache_file);
+
     /* Engage the physical tuner continuously for whichever frequency
      * this thread last processed, regardless of whether it actually
      * locked -- matching real hardware, which keeps a selected tuner's

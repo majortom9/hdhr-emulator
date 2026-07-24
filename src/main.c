@@ -81,7 +81,21 @@ static struct hdhr_tuner  g_tuners[HDHR_MAX_TUNERS];
 static void *scan_thread_main(void *arg)
 {
     (void)arg;
-    dvb_channel_db_clear();
+    /* Deliberately does NOT clear the db first -- dvb_channel_db_add()
+     * already upserts by major.minor (same as the CLI-driven rescan
+     * path in control.c's channel_scan_thread_main, which never clears
+     * either), so a channel found again here just updates in place.
+     * Clearing up front used to be harmless (nothing persisted across
+     * a restart anyway), but now that dvb_channel_db_load() may have
+     * just populated the db from a cache file a few milliseconds ago,
+     * clearing here raced it every time and won essentially always --
+     * confirmed live: lineup.json read immediately after a restart came
+     * back with 0 channels despite the log showing "loaded 75
+     * channel(s) from cache", since this line wiped them out again
+     * before the scan had found a single one of its own. Not clearing
+     * means a channel that's gone off-air since the cache was last
+     * saved lingers until a fresh manual rescan notices it's gone --
+     * the same already-accepted limitation as the CLI-scan path. */
     fprintf(stderr, "dvb_scan: starting full scan on adapter%d (this takes a couple minutes)\n",
              g_cfg.dvb_adapter[0]);
 
@@ -118,6 +132,7 @@ static void *scan_thread_main(void *arg)
     tuner_release(&g_tuners[0]);
 
     fprintf(stderr, "dvb_scan: complete — %d virtual channel(s) found\n", total);
+    dvb_channel_db_save(g_cfg.channel_cache_file);
     return NULL;
 }
 
@@ -159,6 +174,14 @@ int main(int argc, char **argv)
     fprintf(stderr, ")\n");
 
     tuner_pool_init(g_tuners, g_cfg.tuner_count, &g_cfg);
+
+    /* Load any previously-saved channel cache before anything starts
+     * serving requests, so lineup.json/streaming work immediately from
+     * the last-known lineup instead of sitting empty for the ~1-2
+     * minutes the background scan below takes. The scan (if enabled)
+     * still runs regardless and overwrites/refreshes these entries
+     * (and re-saves the cache) once it completes. */
+    dvb_channel_db_load(g_cfg.channel_cache_file);
 
     struct control_ctx ctl = { .cfg = &g_cfg, .tuners = g_tuners };
 
