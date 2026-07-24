@@ -4,7 +4,7 @@ LDLIBS  := -lpthread -lm
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)
-BIN := hdhr-emulator
+BIN := hdhr-emu
 
 .PHONY: all clean install test
 
@@ -36,8 +36,8 @@ clean:
 # Installs the binary + a systemd unit. Run as root on the target Pi.
 install: $(BIN)
 	install -Dm755 $(BIN) /usr/local/bin/$(BIN)
-	install -Dm644 systemd/hdhr-emulator.service /etc/systemd/system/hdhr-emulator.service
-	[ -f /etc/hdhr-emulator.conf ] || install -Dm644 config/hdhr-emulator.conf.example /etc/hdhr-emulator.conf
+	install -Dm644 systemd/hdhr-emu.service /etc/systemd/system/hdhr-emu.service
+	[ -f /etc/hdhr-emu.conf ] || install -Dm644 config/hdhr-emu.conf.example /etc/hdhr-emu.conf
 	setcap 'cap_net_bind_service=+ep' /usr/local/bin/$(BIN) || true
 	systemctl daemon-reload
-	@echo "Edit /etc/hdhr-emulator.conf, then: systemctl enable --now hdhr-emulator"
+	@echo "Edit /etc/hdhr-emu.conf, then: systemctl enable --now hdhr-emu"

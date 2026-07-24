@@ -1,6 +1,6 @@
 # Architecture
 
-This document explains *how* hdhr-emulator is built and, more importantly,
+This document explains *how* hdhr-emu is built and, more importantly,
 *why* several non-obvious design decisions exist — most of them were forced
 by real hardware behavior discovered during live testing on a Raspberry Pi
 3B+ with a USB ATSC tuner (`lgdt3306a` demodulator). The README covers
@@ -484,7 +484,7 @@ exactly would be the wrong choice here:
   daemon is one process regardless of what resource is named, so any
   accepted value triggers a full `exit(0)`. No in-place re-exec; a
   supervisor (systemd's `Restart=always`) is what's expected to bring it
-  back, matching how `systemd/hdhr-emulator.service` is already set up.
+  back, matching how `systemd/hdhr-emu.service` is already set up.
   The reply is sent to the client *before* exiting — already handed to
   the kernel's socket buffer by the time `send_value_reply()` returns,
   so it survives the `exit()` — so a well-behaved client sees a clean

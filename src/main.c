@@ -1,11 +1,11 @@
 /*
- * main.c — hdhr-emulator: makes a USB ATSC tuner look and behave like an
+ * main.c — hdhr-emu: makes a USB ATSC tuner look and behave like an
  * early-Gen3 HDHomeRun on the wire (UDP discovery, TCP control, and
  * HTTP + UDP/RTP-unicast data planes), driving the tuner directly via
  * the Linux DVB API (no TVheadend).
  *
- * Usage: hdhr-emulator [config-file]   (default: /etc/hdhr-emulator.conf)
- *        hdhr-emulator --gen-device-id
+ * Usage: hdhr-emu [config-file]   (default: /etc/hdhr-emu.conf)
+ *        hdhr-emu --gen-device-id
  *            Prints one freshly-generated, checksum-valid device ID and
  *            exits — no config file, no sockets. Paste the result into
  *            device_id= in your config so it stays fixed across restarts
@@ -14,7 +14,7 @@
  *
  * Needs to bind ports 65001 (udp+tcp) and 80 (tcp), so run as root or
  * grant CAP_NET_BIND_SERVICE:
- *   setcap 'cap_net_bind_service=+ep' ./hdhr-emulator
+ *   setcap 'cap_net_bind_service=+ep' ./hdhr-emu
  *
  * Also needs read/write access to each /dev/dvb/adapterN's frontend,
  * demux, and dvr device nodes — either run as root, or add the user to
@@ -149,7 +149,7 @@ int main(int argc, char **argv)
 
     signal(SIGPIPE, SIG_IGN); /* client disconnects mid-stream shouldn't kill us */
 
-    const char *config_path = (argc > 1) ? argv[1] : "/etc/hdhr-emulator.conf";
+    const char *config_path = (argc > 1) ? argv[1] : "/etc/hdhr-emu.conf";
     config_defaults(&g_cfg);
     if (config_load(config_path, &g_cfg) != 0) {
         fprintf(stderr, "main: failed to parse %s\n", config_path);
@@ -166,7 +166,7 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-        "hdhr-emulator starting: friendly_name=\"%s\" model=%s device_id=0x%08X "
+        "hdhr-emu starting: friendly_name=\"%s\" model=%s device_id=0x%08X "
         "tuners=%d (adapters:", g_cfg.friendly_name, g_cfg.model, g_cfg.device_id, g_cfg.tuner_count);
     for (int i = 0; i < g_cfg.tuner_count; i++) {
         fprintf(stderr, " tuner%d->/dev/dvb/adapter%d", i, g_cfg.dvb_adapter[i]);

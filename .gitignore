@@ -1,5 +1,5 @@
 *.o
 *.a
-hdhr-emulator
+hdhr-emu
 calibrate
 /tmp/

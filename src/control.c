@@ -240,8 +240,8 @@ static char g_8vsb_override[32] = "none";
  * clean-room code (see README.md), a different kind of claim than the
  * wire-protocol mimicry the rest of this daemon does. */
 #define HDHR_EMULATOR_COPYRIGHT \
-    "hdhr-emulator — independent, clean-room HDHomeRun-protocol-compatible " \
-    "emulator (github.com/majortom9/hdhr-emulator). Not Silicondust software; " \
+    "hdhr-emu — independent, clean-room HDHomeRun-protocol-compatible " \
+    "emulator (github.com/majortom9/hdhr-emu). Not Silicondust software; " \
     "not affiliated with or endorsed by SiliconDust USA Inc."
 
 static void handle_sys_get(int fd, const struct hdhr_config *cfg, const char *name, const char *leaf)
@@ -327,7 +327,7 @@ static void handle_sys_set(int fd, const struct hdhr_config *cfg, const char *na
          * this daemon is one process either way — any accepted value
          * triggers a full exit. No in-place re-exec: a process
          * supervisor (systemd's Restart=always, etc — see
-         * systemd/hdhr-emulator.service) is what's expected to bring it
+         * systemd/hdhr-emu.service) is what's expected to bring it
          * back up. Reply before exiting so the client sees a clean
          * acknowledgment rather than a communication error; the reply
          * is already handed to the kernel's socket buffer by the time

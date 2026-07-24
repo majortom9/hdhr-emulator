@@ -1,4 +1,4 @@
-# hdhr-emulator
+# hdhr-emu
 
 Makes a USB ATSC tuner on a Raspberry Pi look and behave like an
 early-Gen3 SiliconDust HDHomeRun on the wire — all three protocol
@@ -249,7 +249,7 @@ Needs to bind ports 65001 (UDP+TCP) and 80 (TCP), and read/write
 `/dev/dvb/adapterN/{frontend,demux,dvr}0`:
 
 ```sh
-sudo ./hdhr-emulator ./config/hdhr-emulator.conf.example
+sudo ./hdhr-emu ./config/hdhr-emu.conf.example
 ```
 
 or install as a systemd service (runs as root, simplest way to get both
@@ -258,8 +258,8 @@ capabilities + group membership separately):
 
 ```sh
 sudo make install
-sudo $EDITOR /etc/hdhr-emulator.conf   # set tuner_count, adapter mapping, device_id, etc.
-sudo systemctl enable --now hdhr-emulator
+sudo $EDITOR /etc/hdhr-emu.conf   # set tuner_count, adapter mapping, device_id, etc.
+sudo systemctl enable --now hdhr-emu
 ```
 
 Startup runs the ATSC scan (all US RF channels, ~1-2 minutes) in the
@@ -271,7 +271,7 @@ found`.
 ## Generating a stable device ID
 
 ```sh
-./hdhr-emulator --gen-device-id
+./hdhr-emu --gen-device-id
 ```
 
 prints one fresh, checksum-valid ID and exits — paste it into

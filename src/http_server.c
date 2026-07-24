@@ -42,12 +42,12 @@ static void send_headers(int fd, const char *status, const char *content_type, l
     if (content_length >= 0) {
         n = snprintf(hdr, sizeof(hdr),
                       "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
-                      "Connection: close\r\nServer: hdhr-emulator\r\n\r\n",
+                      "Connection: close\r\nServer: hdhr-emu\r\n\r\n",
                       status, content_type, content_length);
     } else {
         n = snprintf(hdr, sizeof(hdr),
                       "HTTP/1.1 %s\r\nContent-Type: %s\r\n"
-                      "Connection: close\r\nServer: hdhr-emulator\r\n\r\n",
+                      "Connection: close\r\nServer: hdhr-emu\r\n\r\n",
                       status, content_type);
     }
     if (write(fd, hdr, (size_t)n) < 0) { /* client already gone */ }
@@ -206,7 +206,7 @@ static void stream_channel_to_client(int fd, const struct hdhr_config *cfg,
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\nContent-Type: video/mpeg\r\n"
-        "Connection: close\r\nServer: hdhr-emulator\r\n\r\n");
+        "Connection: close\r\nServer: hdhr-emu\r\n\r\n");
     if (write(fd, hdr, (size_t)hn) < 0) { tuner_release(t); return; }
 
     uint8_t buf[188 * 64];

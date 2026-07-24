@@ -88,7 +88,7 @@ bool dvb_channel_db_save(const char *path)
         return false;
     }
 
-    fprintf(f, "# hdhr-emulator channel cache -- generated, do not edit by hand.\n"
+    fprintf(f, "# hdhr-emu channel cache -- generated, do not edit by hand.\n"
                "# major minor rf_channel delivery frequency_hz channel_tsid "
                "program_number pmt_pid pcr_pid video_pid video_stream_type "
                "audio_pid audio_stream_type short_name\n");
