@@ -8,7 +8,6 @@
 # SiliconDust apps; run `./hdhr-emulator --gen-device-id` to print a fresh
 # valid one, then paste it here.
 #device_id=0x1042304F
-device_id=0x103AC106
 
 friendly_name=HDHomeRun Connect
 model=HDHR4-2US
